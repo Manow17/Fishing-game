@@ -1,0 +1,299 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ambience preview</title>
+<style>
+  body { margin: 0; font: 13px/1.4 system-ui, sans-serif; background: #1d2421; color: #e6efe8; }
+  main { max-width: 1100px; margin: 0 auto; padding: 14px 16px 40px; }
+  h1 { font-size: 17px; margin: 4px 0 10px; }
+  h2 { font-size: 13px; margin: 16px 0 6px; color: #9fc2ad; text-transform: uppercase; letter-spacing: .06em; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
+  button { background: #2f4a3c; color: #fff; border: 1px solid #4b6d5a; border-radius: 5px; padding: 5px 9px; cursor: pointer; font: inherit; }
+  button:hover { background: #3c5e4c; }
+  button.primary { background: #c96b2c; border-color: #e08b4c; }
+  label { display: inline-flex; gap: 6px; align-items: center; }
+  input[type=range] { width: 120px; }
+  .v { min-width: 34px; display: inline-block; color: #f3d38a; }
+  #meter { font-family: ui-monospace, monospace; background: #111614; padding: 8px; border-radius: 6px; white-space: pre; }
+  canvas { width: 100%; background: #000; border-radius: 6px; image-rendering: pixelated; }
+  pre { background: #111614; padding: 8px; border-radius: 6px; overflow-x: auto; max-height: 420px; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<main>
+  <h1>Alpenfisch ambience preview</h1>
+  <div class="row">
+    <button id="start" class="primary">Start audio</button>
+    <label>Place <select id="preset"></select></label>
+    <label><input type="checkbox" id="onLand"> on land</label>
+    <label><input type="checkbox" id="beds" checked> beds</label>
+    <label><input type="checkbox" id="auto" checked> auto events</label>
+  </div>
+  <div class="row" id="sliders" style="margin-top:8px"></div>
+
+  <h2>Trigger</h2>
+  <div class="row" id="triggers"></div>
+  <h2>Foley</h2>
+  <div class="row" id="foley"></div>
+
+  <h2>Live meter (master)</h2>
+  <div id="meter">not started</div>
+
+  <h2>Offline analysis</h2>
+  <div class="row">
+    <button id="levels">Measure levels (contexts)</button>
+    <label>Spectrogram of <select id="specSel"></select></label>
+    <button id="spec">Render</button>
+  </div>
+  <canvas id="canvas" width="1000" height="256" style="margin-top:8px"></canvas>
+  <pre id="log"></pre>
+</main>
+<script type="module">
+import * as THREE from 'three';
+import { Audio } from '../src/game/audio.js';
+import { Ambience } from '../src/game/ambience.js';
+import { SPAWN_Z, VILLAGE_SIDE, bankX } from '../src/world/layout.js';
+import { centerX, halfWidth, waterY, rapids as rapidsAt } from '../src/world/river.js';
+
+const $ = (id) => document.getElementById(id);
+const log = (...a) => { $('log').textContent += a.join(' ') + '\n'; };
+
+// ---- places (world coordinates, same as the game)
+const villageX = bankX(SPAWN_Z, VILLAGE_SIDE, 60);
+const PRESETS = {
+  dock: () => ({ x: bankX(SPAWN_Z, VILLAGE_SIDE, 1.5) - VILLAGE_SIDE * 16, z: SPAWN_Z, land: false }),
+  meadow: () => ({ x: bankX(SPAWN_Z + 20, VILLAGE_SIDE, 40), z: SPAWN_Z + 20, land: true, wd: 40 }),
+  shore: () => ({ x: bankX(SPAWN_Z - 30, VILLAGE_SIDE, 4), z: SPAWN_Z - 30, land: true, wd: 4 }),
+  midriver: () => ({ x: centerX(0), z: 0, land: false }),
+  nearBank: () => ({ x: centerX(800) + halfWidth(800) - 8, z: 800, land: false }),
+  rapids: () => ({ x: centerX(330), z: 330, land: false }),
+};
+for (const k in PRESETS) $('preset').add(new Option(k, k));
+
+const S = { rapids: 0, speed: 0, throttle: 0, nearVillage: 0, waterDist: 0, yaw: 0 };
+const RANGES = { rapids: [0, 1, 0.01], speed: [0, 12, 0.1], throttle: [-1, 1, 0.01], nearVillage: [0, 1, 0.01], waterDist: [0, 200, 1], yaw: [-3.14, 3.14, 0.01] };
+for (const k in RANGES) {
+  const [a, b, st] = RANGES[k];
+  const l = document.createElement('label');
+  l.innerHTML = `${k} <input type="range" id="s_${k}" min="${a}" max="${b}" step="${st}" value="0"> <span class="v" id="v_${k}">0</span>`;
+  $('sliders').appendChild(l);
+  l.querySelector('input').addEventListener('input', (e) => { S[k] = +e.target.value; $('v_' + k).textContent = S[k]; });
+}
+const setS = (k, v) => { S[k] = v; $('s_' + k).value = v; $('v_' + k).textContent = +(+v).toFixed(2); };
+
+const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
+let pos = { x: 0, y: 0, z: 0 };
+function applyPreset() {
+  const p = PRESETS[$('preset').value]();
+  const land = !!p.land;
+  pos = { x: p.x, y: waterY(p.z) + (land ? 4 : 2.5), z: p.z };
+  $('onLand').checked = land;
+  setS('rapids', +rapidsAt(p.z).toFixed(2));
+  setS('nearVillage', +Math.max(0, 1 - Math.hypot(p.x - villageX, p.z - SPAWN_Z) / 400).toFixed(2));
+  setS('waterDist', land ? p.wd : 0);
+}
+$('preset').addEventListener('change', applyPreset);
+applyPreset();
+
+function ctxState() {
+  camera.position.set(pos.x, pos.y, pos.z);
+  camera.rotation.set(0, S.yaw, 0);
+  camera.updateMatrixWorld();
+  return { rapids: S.rapids, throttle: S.throttle, speed: S.speed, nearVillage: S.nearVillage, camera, onLand: $('onLand').checked, waterDist: S.waterDist };
+}
+
+// ---- live
+const audio = new Audio();
+let analyser = null, last = performance.now(), peakHold = 0, peakT = 0;
+$('start').addEventListener('click', () => {
+  audio.init(); audio.resume();
+  if (!analyser) {
+    analyser = audio.ctx.createAnalyser(); analyser.fftSize = 2048; audio.master.connect(analyser);
+    requestAnimationFrame(loop);
+  }
+  $('start').textContent = 'Running';
+});
+const buf = new Float32Array(2048);
+function loop(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  audio.amb.beds = $('beds').checked; audio.amb.auto = $('auto').checked;
+  audio.ambience(dt, ctxState());
+  analyser.getFloatTimeDomainData(buf);
+  let ss = 0, pk = 0;
+  for (const x of buf) { ss += x * x; pk = Math.max(pk, Math.abs(x)); }
+  if (pk > peakHold || now - peakT > 10000) { peakHold = pk; peakT = now; }
+  const db = (v) => (20 * Math.log10(Math.max(v, 1e-6))).toFixed(1);
+  const a = audio.amb;
+  $('meter').textContent = `RMS ${db(Math.sqrt(ss / buf.length))} dBFS   peak ${db(pk)}   peak(10s) ${db(peakHold)}\n` +
+    `live voices ${a.live.length}   birds ${a.birds.map((b) => b.sp).join(',')}\n` +
+    `land ${a.c.land.toFixed(2)} river ${a.c.river.toFixed(2)} bank ${a.c.bank.toFixed(0)} birdAct ${a.c.birdAct.toFixed(2)} gust ${a.gust.v.toFixed(2)} insects ${a.c.insects.toFixed(2)} ctx ${audio.ctx.state}`;
+  window.__live = { rms: Math.sqrt(ss / buf.length), pk, peakHold, live: a.live.length, birds: a.birds.length, state: audio.ctx.state };
+  requestAnimationFrame(loop);
+}
+
+const TRIG = ['chaffinch', 'blackbird', 'greattit', 'chiffchaff', 'wren', 'robin', 'cuckoo', 'woodpecker', 'raptor', 'cowbell', 'church', 'dog', 'rooster', 'alphorn', 'bee', 'gurgle', 'splash', 'lap', 'shoreLap', 'gust'];
+for (const k of TRIG) {
+  const b = document.createElement('button'); b.textContent = k;
+  b.onclick = () => audio.amb && audio.amb.trigger(k);
+  $('triggers').appendChild(b);
+}
+const FOLEY = { 'step grass': () => audio.footstep('grass'), 'step wood': () => audio.footstep('wood'), 'step gravel': () => audio.footstep('gravel'), coins: () => audio.coins(), purchase: () => audio.purchase(), shopBell: () => audio.shopBell(), jingle: () => audio.jingle() };
+for (const k in FOLEY) { const b = document.createElement('button'); b.textContent = k; b.onclick = () => audio.ctx && FOLEY[k](); $('foley').appendChild(b); }
+
+// ---- offline rendering (no user gesture needed): levels + spectrograms
+async function render({ secs, place, beds = true, auto = true, setup = null, step = 0.05, s = {} }) {
+  const sr = 44100, off = new OfflineAudioContext(2, Math.ceil(sr * secs), sr);
+  const master = off.createGain(); master.gain.value = 0.8; master.connect(off.destination);
+  const amb = new Ambience(off, master);
+  amb.beds = beds; amb.auto = auto;
+  amb.out.gain.cancelScheduledValues(0); amb.out.gain.value = 1.35;
+  const p = PRESETS[place]();
+  const cam = new THREE.PerspectiveCamera();
+  cam.position.set(p.x, waterY(p.z) + (p.land ? 4 : 2.5), p.z); cam.updateMatrixWorld();
+  const st = Object.assign({ rapids: rapidsAt(p.z), nearVillage: Math.max(0, 1 - Math.hypot(p.x - villageX, p.z - SPAWN_Z) / 400), onLand: !!p.land, waterDist: p.land ? p.wd : 0, speed: 0, throttle: 0, camera: cam }, s);
+  // per-layer / per-bus meters (stereo, via splitters)
+  const meters = {};
+  const meter = (name, node) => {
+    const sp = off.createChannelSplitter(2), a = off.createAnalyser(), b = off.createAnalyser();
+    a.fftSize = b.fftSize = 2048; node.connect(sp); sp.connect(a, 0); sp.connect(b, 1);
+    meters[name] = { a, b, sum: 0, n: 0 };
+  };
+  for (const k in amb.layers) meter('layer.' + k, amb.layers[k].g);
+  for (const k in amb.bus) meter('bus.' + k, amb.bus[k]);
+  const tmp = new Float32Array(2048);
+  let maxLive = 0, evLog = [];
+  for (let i = 1; i * step < secs - step; i++) {
+    off.suspend(i * step).then(() => {
+      amb.update(step, st);
+      if (i === 1 && setup) setup(amb);
+      for (const k in meters) {
+        const m = meters[k];
+        let ss = 0;
+        for (const an of [m.a, m.b]) { an.getFloatTimeDomainData(tmp); for (const x of tmp) ss += x * x; }
+        m.sum += ss / 4096; m.n++;
+      }
+      maxLive = Math.max(maxLive, amb.live.length);
+      off.resume();
+    });
+  }
+  const t0 = performance.now();
+  const out = await off.startRendering();
+  const L = out.getChannelData(0), R = out.getChannelData(1);
+  let ss = 0, pk = 0;
+  for (let i = 0; i < L.length; i++) { ss += L[i] * L[i] + R[i] * R[i]; pk = Math.max(pk, Math.abs(L[i]), Math.abs(R[i])); }
+  const win = [];
+  for (let w = 0; w + sr <= L.length; w += sr) { let s2 = 0; for (let i = w; i < w + sr; i++) s2 += L[i] * L[i] + R[i] * R[i]; win.push(Math.sqrt(s2 / (2 * sr))); }
+  const db = (v) => +(20 * Math.log10(Math.max(v, 1e-7))).toFixed(1);
+  const res = { place, secs, renderMs: Math.round(performance.now() - t0), rmsDb: db(Math.sqrt(ss / (2 * L.length))), peakDb: db(pk),
+    winMinDb: db(Math.min(...win)), winMaxDb: db(Math.max(...win)), maxLive, birds: amb.birds.map((b) => b.sp).join(','), parts: {} };
+  for (const k in meters) { const m = meters[k]; const v = m.n ? Math.sqrt(m.sum / m.n) * 0.8 : 0; if (v > 1e-5) res.parts[k] = db(v); }
+  res.buffer = out;
+  return res;
+}
+
+$('levels').onclick = async () => {
+  $('log').textContent = '';
+  const cases = [
+    ['dock', {}], ['midriver', {}], ['nearBank', {}], ['rapids', {}], ['midriver', { speed: 9, throttle: 1 }], ['meadow', {}], ['shore', {}],
+  ];
+  const all = [];
+  for (const [place, s] of cases) {
+    const r = await render({ secs: 16, place, s });
+    delete r.buffer;
+    r.s = JSON.stringify(s);
+    all.push(r);
+    log(`${place.padEnd(9)} ${r.s.padEnd(26)} RMS ${r.rmsDb} dBFS  peak ${r.peakDb}  1s-win ${r.winMinDb}..${r.winMaxDb}  live<=${r.maxLive}  render ${r.renderMs}ms`);
+    log('   ' + Object.entries(r.parts).map(([k, v]) => `${k} ${v}`).join(' | '));
+  }
+  window.__levels = all;
+};
+
+// spectrogram
+const SPEC = ['chaffinch', 'blackbird', 'greattit', 'chiffchaff', 'wren', 'robin', 'cuckoo', 'woodpecker', 'raptor', 'cowbell', 'church', 'dog', 'rooster', 'alphorn', 'bee', 'gurgle', 'splash', 'lap', 'shoreLap',
+  'foley:grass', 'foley:wood', 'foley:gravel', 'foley:coins', 'foley:purchase', 'foley:shopBell', 'bed:dock', 'bed:rapids', 'bed:meadow'];
+for (const k of SPEC) $('specSel').add(new Option(k, k));
+
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) { let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; } }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let j = 0; j < len / 2; j++) {
+        const ar = re[i + j], ai = im[i + j], br = re[i + j + len / 2] * cr - im[i + j + len / 2] * ci, bi = re[i + j + len / 2] * ci + im[i + j + len / 2] * cr;
+        re[i + j] = ar + br; im[i + j] = ai + bi; re[i + j + len / 2] = ar - br; im[i + j + len / 2] = ai - bi;
+        const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+      }
+    }
+  }
+}
+function drawSpec(buffer, title, fmax = 9000) {
+  const c = $('canvas'), g = c.getContext('2d'), sr = buffer.sampleRate;
+  const L = buffer.getChannelData(0), R = buffer.getChannelData(1), N = 1024, hop = Math.max(64, Math.floor((L.length - N) / c.width));
+  const bins = Math.floor(fmax / (sr / N));
+  const img = g.createImageData(c.width, c.height);
+  const re = new Float64Array(N), im = new Float64Array(N);
+  const cols = [];
+  let top = -200;
+  for (let x = 0; x < c.width; x++) {
+    const o = x * hop;
+    for (let i = 0; i < N; i++) { const w = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N); re[i] = ((L[o + i] || 0) + (R[o + i] || 0)) * 0.5 * w; im[i] = 0; }
+    fft(re, im);
+    const col = new Float32Array(c.height);
+    for (let y = 0; y < c.height; y++) {
+      const b = Math.floor((1 - y / c.height) * bins);
+      col[y] = 20 * Math.log10(Math.hypot(re[b], im[b]) + 1e-9);
+      top = Math.max(top, col[y]);
+    }
+    cols.push(col);
+  }
+  for (let x = 0; x < c.width; x++) {
+    for (let y = 0; y < c.height; y++) {
+      const v = Math.max(0, Math.min(1, (cols[x][y] - top + 60) / 60));
+      const p = (y * c.width + x) * 4;
+      img.data[p] = 255 * Math.min(1, v * 1.6); img.data[p + 1] = 255 * Math.max(0, v * 1.6 - 0.5); img.data[p + 2] = 120 * v + 40 * (1 - v); img.data[p + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  g.fillStyle = '#fff'; g.font = '12px sans-serif';
+  g.fillText(`${title}   0..${fmax} Hz, ${(L.length / sr).toFixed(1)} s`, 6, 14);
+  for (let f = 1000; f < fmax; f += 1000) { const y = c.height * (1 - f / fmax); g.fillStyle = 'rgba(255,255,255,.25)'; g.fillRect(0, y, 8, 1); g.fillText(f / 1000 + 'k', 10, y + 4); }
+}
+
+async function renderOne(kind) {
+  let secs = 5, place = 'meadow', setup, beds = false, fmax = 9000, s = {};
+  if (kind.startsWith('foley:')) {
+    const f = kind.slice(6); secs = f === 'coins' || f === 'shopBell' || f === 'purchase' ? 3 : 1.2; fmax = 12000;
+    setup = (a) => { if (f === 'grass' || f === 'wood' || f === 'gravel') { a.footstep(f); } else a[f](); };
+  } else if (kind.startsWith('bed:')) {
+    place = kind.slice(4); beds = true; secs = 6; fmax = 8000;
+  } else {
+    secs = { cuckoo: 9, woodpecker: 10, raptor: 9, church: 14, alphorn: 24, cowbell: 6, dog: 7, rooster: 4, bee: 5, wren: 5 }[kind] || 4;
+    if (['gurgle', 'splash', 'lap'].includes(kind)) place = kind === 'splash' ? 'rapids' : 'dock';
+    if (kind === 'shoreLap') place = 'shore';
+    if (['cowbell', 'church', 'dog', 'rooster'].includes(kind)) place = 'meadow';
+    if (['cuckoo', 'church', 'alphorn', 'raptor', 'cowbell', 'dog', 'rooster'].includes(kind)) fmax = 4500;
+    if (['gurgle', 'lap', 'shoreLap', 'bee', 'woodpecker'].includes(kind)) fmax = 4000;
+    setup = (a) => a.trigger(kind);
+  }
+  const r = await render({ secs, place, beds, auto: false, setup, s });
+  drawSpec(r.buffer, kind, fmax);
+  delete r.buffer;
+  log(`${kind}: RMS ${r.rmsDb}  peak ${r.peakDb}  1s-win max ${r.winMaxDb}  live<=${r.maxLive}`);
+  return r;
+}
+$('spec').onclick = () => renderOne($('specSel').value);
+window.renderOne = renderOne;
+window.render = render;
+</script>
+</body>
+</html>

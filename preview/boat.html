@@ -1,0 +1,158 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Weidling preview</title>
+<style>
+html,body{margin:0;height:100%;background:#8fb3d9;overflow:hidden;font:12px/1.4 system-ui,sans-serif}
+canvas{display:block}
+#ui{position:fixed;left:10px;top:10px;background:rgba(15,25,30,.72);color:#e8f1f2;padding:10px 12px;border-radius:8px;min-width:230px}
+#ui label{display:flex;justify-content:space-between;gap:8px;align-items:center;margin:4px 0}
+#ui input[type=range]{width:130px}
+#ui .views button{margin:2px 2px 0 0;font-size:11px}
+#stats{margin-top:6px;color:#9fd6cf;white-space:pre}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <b>Weidling preview</b>
+  <label>Throttle (W/S) <input id="thr" type="range" min="-1" max="1" step="0.01" value="0"></label>
+  <label>Steer (A/D) <input id="str" type="range" min="-1" max="1" step="0.01" value="0"></label>
+  <label>Anchor (Q) <input id="anc" type="checkbox"></label>
+  <label>Bob on water <input id="bob" type="checkbox"></label>
+  <label>Look yaw <input id="lyaw" type="range" min="-3" max="3" step="0.01" value="0"></label>
+  <label>Look pitch <input id="lpit" type="range" min="-1" max="1" step="0.01" value="0"></label>
+  <label>Fisher 1st person <input id="fp" type="checkbox"></label>
+  <div class="views">Views: <button data-v="overview">1 overview</button><button data-v="side">2 side</button><button data-v="bow">3 bow</button><button data-v="motor">4 motor</button><button data-v="interior">5 interior</button><button data-v="top">6 top</button><button data-v="anglers">7 anglers</button><button data-v="under">8 under</button></div>
+  <div id="stats"></div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { createBoat, createLandingNet } from '../src/models/boat.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x8fb3d9);
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.6;
+const sun = new THREE.DirectionalLight(0xfff1dd, 3); sun.position.set(5, 8, 4); sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048); Object.assign(sun.shadow.camera, { left: -5, right: 5, top: 5, bottom: -5, near: 0.5, far: 30 });
+sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.02;
+scene.add(sun);
+scene.add(new THREE.HemisphereLight(0xbfd8ff, 0x5a4a30, 0.6));
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.01, 500);
+camera.position.set(5, 3, 6);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.3, 0);
+
+// water: deep opaque blue + semi-transparent turquoise surface at y=0 (rendered like the game's water)
+const deep = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.MeshStandardMaterial({ color: 0x1d4f6e, roughness: 0.9 }));
+deep.rotation.x = -Math.PI / 2; deep.position.y = -1.4; deep.receiveShadow = true; scene.add(deep);
+const surf = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.MeshPhysicalMaterial({ color: 0x3fbfb5, transparent: true, opacity: 0.55, roughness: 0.08, metalness: 0, depthWrite: true }));
+surf.rotation.x = -Math.PI / 2; surf.renderOrder = 2; surf.receiveShadow = true; scene.add(surf);
+
+const boat = createBoat({ accent: 0xe8452c });
+scene.add(boat.object);
+const net = createLandingNet();
+boat.object.add(net.object);
+net.object.position.copy(boat.netRest.position); net.object.quaternion.copy(boat.netRest.quaternion);
+
+// dummy rod handle in front of the fisher
+const rod = new THREE.Group();
+const blank = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.012, 2.2, 8), new THREE.MeshStandardMaterial({ color: 0x223322, roughness: 0.4 }));
+blank.rotation.x = Math.PI / 2; blank.position.z = 1.1; rod.add(blank);
+const grip = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.014, 0.45, 10), new THREE.MeshStandardMaterial({ color: 0x5a3b22, roughness: 0.8 }));
+grip.rotation.x = Math.PI / 2; grip.position.z = -0.1; rod.add(grip);
+const gripRight = new THREE.Object3D(); gripRight.position.set(0, 0, 0.0); rod.add(gripRight);
+const gripLeft = new THREE.Object3D(); gripLeft.position.set(0, 0, -0.3); rod.add(gripLeft);
+rod.position.set(0.05, 0.6, 0.0); rod.rotation.set(-0.5, 0.15, 0);
+boat.object.add(rod);
+
+let fisher = null, driver = null;
+try {
+  const { createAngler } = await import('../src/models/angler.js');
+  fisher = createAngler({ shirt: 0x8a2f2a, vest: 0x5b6b3a, hat: 0xc9b98f, name: 'Ueli' });
+  fisher.object.position.copy(boat.seats.fisher); boat.object.add(fisher.object);
+  driver = createAngler({ shirt: 0x2f5f8a, vest: 0x7a5b3a, hat: 0x3d4a5c, skin: 0xd9a77f, name: 'Vreni' });
+  driver.object.position.copy(boat.seats.driver); boat.object.add(driver.object);
+} catch (e) { console.warn('angler not available yet', e); }
+
+// UI
+const $ = id => document.getElementById(id);
+const keys = {};
+addEventListener('keydown', e => { keys[e.code] = true; if (e.code === 'KeyQ') { $('anc').checked = !$('anc').checked; } const v = '12345678'.indexOf(e.key); if (v >= 0) view(Object.keys(VIEWS)[v]); });
+addEventListener('keyup', e => { keys[e.code] = false; });
+const VIEWS = {
+  overview: [[5.2, 2.6, 5.6], [0, 0.3, 0]],
+  side: [[7.5, 1.2, 0.2], [0, 0.35, 0]],
+  bow: [[1.3, 1.25, 4.9], [0, 0.8, 3.4]],
+  motor: [[1.25, 0.75, -4.7], [0, 0.35, -3.8]],
+  interior: [[0.05, 1.45, -3.6], [0, 0.0, 0.8]],
+  top: [[0.01, 9, 0], [0, 0, 0]],
+  anglers: [[1.9, 1.35, -1.2], [0, 0.6, -1.8]],
+  under: [[2.5, -0.6, 1.5], [0, -0.1, 0]],
+};
+function view(n) { const v = VIEWS[n]; if (!v) return; camera.position.set(...v[0]); controls.target.set(...v[1]); controls.update(); }
+document.querySelectorAll('.views button').forEach(b => b.onclick = () => view(b.dataset.v));
+window.__view = view; window.__boat = boat; window.__scene = scene; window.__camera = camera; window.__controls = controls;
+window.__setFirstPersonCam = () => { if (!fisher) return; const p = fisher.head.getWorldPosition(new THREE.Vector3()); camera.position.copy(p); const d = new THREE.Vector3(0, -0.35, 1); controls.target.copy(p).add(d); controls.update(); };
+
+function boatOnlyStats() {
+  let calls = 0, tris = 0;
+  const skip = new Set([net.object, rod, fisher?.object, driver?.object].filter(Boolean));
+  const walk = (o) => { if (skip.has(o)) return; if (o.isMesh && o.visible) { calls++; const g = o.geometry; tris += (g.index ? g.index.count : g.attributes.position.count) / 3; } o.children.forEach(walk); };
+  walk(boat.object);
+  return { calls, tris: Math.round(tris) };
+}
+window.__stats = () => ({ boat: boatOnlyStats(), render: { calls: renderer.info.render.calls, tris: renderer.info.render.triangles } });
+
+const clock = new THREE.Clock();
+const tmpR = new THREE.Vector3(), tmpL = new THREE.Vector3(), tmpT = new THREE.Vector3();
+let frame = 0;
+function tick(forceDt) {
+  const dt = forceDt ?? Math.min(0.05, clock.getDelta()); const t = clock.elapsedTime;
+  if (keys.KeyW) $('thr').value = Math.min(1, +$('thr').value + dt);
+  if (keys.KeyS) $('thr').value = Math.max(-1, +$('thr').value - dt);
+  if (keys.KeyA) $('str').value = Math.max(-1, +$('str').value - dt * 2);
+  if (keys.KeyD) $('str').value = Math.min(1, +$('str').value + dt * 2);
+  boat.setThrottle(+$('thr').value); boat.setSteer(+$('str').value); boat.setAnchor($('anc').checked);
+  if ($('bob').checked) { boat.object.position.y = Math.sin(t * 1.3) * 0.03; boat.object.rotation.z = Math.sin(t * 0.9) * 0.03; boat.object.rotation.x = Math.sin(t * 0.7) * 0.012; }
+  else { boat.object.position.y = 0; boat.object.rotation.set(0, 0, 0); }
+  boat.update(dt, t);
+  boat.object.updateMatrixWorld(true);
+  if (fisher) {
+    fisher.setLook(+$('lyaw').value, +$('lpit').value);
+    fisher.setFirstPerson($('fp').checked);
+    fisher.setHandTargets(gripRight.getWorldPosition(tmpR), gripLeft.getWorldPosition(tmpL));
+    fisher.update(dt);
+  }
+  if (driver) {
+    driver.setLook(0.25, -0.1);
+    driver.setHandTargets(boat.tillerGrip.getWorldPosition(tmpT), null);
+    driver.update(dt);
+  }
+  controls.update();
+  renderer.render(scene, camera);
+  if ((frame++ & 31) === 0) { const s = window.__stats(); $('stats').textContent = `boat: ${s.boat.calls} draw calls, ${s.boat.tris} tris\nframe: ${s.render.calls} calls, ${s.render.tris} tris`; }
+}
+renderer.setAnimationLoop(() => tick());
+window.__tick = (n = 1) => { for (let i = 0; i < n; i++) tick(0.033); return true; };
+view('overview');
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+</script>
+</body>
+</html>

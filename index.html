@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alpenfisch</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23cf3a2c'/%3E%3Cpath d='M13 6h6v7h7v6h-7v7h-6v-7H6v-6h7z' fill='%23fbf6ea'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800&family=Barlow:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Caveat:wght@500;700&family=Courier+Prime:wght@400;700&family=Fraunces:ital,opsz,wght,SOFT,WONK@0,9..144,500..900,0..100,0..1;1,9..144,500..900,0..100,0..1&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+<script>
+/* Procedural stationery: tileable topographic contour lines and paper grain, drawn once on canvases
+   and exposed as CSS custom properties (--topo, --topo-light, --grain). The HUD minimap reuses the
+   "map" contour canvas via window.__afPaper. */
+(function () {
+  try {
+    var T = 384, N = 96, C = T / N, root = document.documentElement;
+    var seed = 1291;
+    function rnd() { seed = seed + 0x6D2B79F5 | 0; var t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }
+    // periodic gradient noise (wraps every tile, so the pattern repeats seamlessly)
+    function octave(G, amp) { var g = new Float32Array(G * G * 2); for (var i = 0; i < G * G; i++) { var a = rnd() * 6.2832; g[i * 2] = Math.cos(a); g[i * 2 + 1] = Math.sin(a); } return { G: G, amp: amp, g: g }; }
+    var octs = [octave(2, 1), octave(4, 0.55), octave(8, 0.22)];
+    function fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+    function noise(u, v) {
+      var s = 0;
+      for (var k = 0; k < octs.length; k++) {
+        var o = octs[k], G = o.G, x = u * G, y = v * G, x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+        var X0 = x0 % G, Y0 = y0 % G, X1 = (X0 + 1) % G, Y1 = (Y0 + 1) % G, g = o.g;
+        var n00 = g[(Y0 * G + X0) * 2] * fx + g[(Y0 * G + X0) * 2 + 1] * fy;
+        var n10 = g[(Y0 * G + X1) * 2] * (fx - 1) + g[(Y0 * G + X1) * 2 + 1] * fy;
+        var n01 = g[(Y1 * G + X0) * 2] * fx + g[(Y1 * G + X0) * 2 + 1] * (fy - 1);
+        var n11 = g[(Y1 * G + X1) * 2] * (fx - 1) + g[(Y1 * G + X1) * 2 + 1] * (fy - 1);
+        var ux = fade(fx), uy = fade(fy);
+        s += o.amp * ((n00 + (n10 - n00) * ux) * (1 - uy) + (n01 + (n11 - n01) * ux) * uy);
+      }
+      return s;
+    }
+    var M = N + 1, f = new Float32Array(M * M), lo = 1e9, hi = -1e9;
+    for (var j = 0; j < M; j++) for (var i = 0; i < M; i++) { var v = noise((i % N) / N, (j % N) / N); f[j * M + i] = v; if (v < lo) lo = v; if (v > hi) hi = v; }
+    // marching squares → one segment list per contour level
+    var LEVELS = 16, step = (hi - lo) / (LEVELS + 1), levels = [];
+    for (var l = 1; l <= LEVELS; l++) {
+      var L = lo + l * step, seg = [];
+      for (var j = 0; j < N; j++) for (var i = 0; i < N; i++) {
+        var a = f[j * M + i], b = f[j * M + i + 1], c = f[(j + 1) * M + i + 1], d = f[(j + 1) * M + i];
+        var id = (a > L ? 8 : 0) | (b > L ? 4 : 0) | (c > L ? 2 : 0) | (d > L ? 1 : 0);
+        if (id === 0 || id === 15) continue;
+        var top = [i + (L - a) / (b - a), j], rgt = [i + 1, j + (L - b) / (c - b)], bot = [i + (L - d) / (c - d), j + 1], lft = [i, j + (L - a) / (d - a)];
+        switch (id) {
+          case 1: case 14: seg.push(lft, bot); break;
+          case 2: case 13: seg.push(bot, rgt); break;
+          case 3: case 12: seg.push(lft, rgt); break;
+          case 4: case 11: seg.push(top, rgt); break;
+          case 6: case 9: seg.push(top, bot); break;
+          case 7: case 8: seg.push(top, lft); break;
+          case 5: seg.push(top, lft, rgt, bot); break;
+          case 10: seg.push(top, rgt, bot, lft); break;
+        }
+      }
+      levels.push(seg);
+    }
+    function draw(color, alpha, idxAlpha, w) {
+      var cv = document.createElement('canvas'); cv.width = cv.height = T;
+      var x = cv.getContext('2d'); x.lineCap = 'round'; x.strokeStyle = color;
+      for (var l = 0; l < levels.length; l++) {
+        var s = levels[l], index = l % 5 === 2;
+        x.globalAlpha = index ? idxAlpha : alpha; x.lineWidth = index ? w * 1.6 : w;
+        x.beginPath();
+        for (var k = 0; k < s.length; k += 2) { x.moveTo(s[k][0] * C, s[k][1] * C); x.lineTo(s[k + 1][0] * C, s[k + 1][1] * C); }
+        x.stroke();
+      }
+      return cv;
+    }
+    var grain = document.createElement('canvas'); grain.width = grain.height = 160;
+    var gx = grain.getContext('2d'), im = gx.createImageData(160, 160), p = im.data;
+    for (var q = 0; q < p.length; q += 4) { var r = rnd(); p[q] = 92; p[q + 1] = 70; p[q + 2] = 38; p[q + 3] = Math.pow(r, 4) * 46; }
+    gx.putImageData(im, 0, 0);
+    gx.strokeStyle = 'rgba(110,84,44,0.07)'; gx.lineWidth = 0.6;
+    for (var k = 0; k < 26; k++) { var px = rnd() * 160, py = rnd() * 160, an = rnd() * 6.28, ln = 4 + rnd() * 12; gx.beginPath(); gx.moveTo(px, py); gx.quadraticCurveTo(px + Math.cos(an + 0.6) * ln * 0.6, py + Math.sin(an + 0.6) * ln * 0.6, px + Math.cos(an) * ln, py + Math.sin(an) * ln); gx.stroke(); }
+    var canv = {
+      topo: draw('rgb(128,92,44)', 0.13, 0.22, 1),
+      'topo-light': draw('rgb(246,238,214)', 0.08, 0.14, 1),
+      grain: grain,
+    };
+    window.__afPaper = { map: draw('rgb(150,108,58)', 0.34, 0.55, 1), topo: canv.topo, grain: grain };
+    Object.keys(canv).forEach(function (name) {
+      var cv = canv[name];
+      var set = function (url) { root.style.setProperty('--' + name, 'url("' + url + '")'); };
+      if (cv.toBlob && window.URL && URL.createObjectURL) cv.toBlob(function (b) { if (b) set(URL.createObjectURL(b)); else set(cv.toDataURL()); });
+      else set(cv.toDataURL());
+    });
+  } catch (e) { console.warn('paper textures unavailable', e); }
+})();
+</script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<!-- shared SVG defs: rubber-stamp ink filter + icons -->
+<svg class="svg-defs" width="0" height="0" aria-hidden="true" focusable="false">
+  <defs>
+    <filter id="ink-rough" x="-6%" y="-6%" width="112%" height="112%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="2" seed="3" result="n"/>
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="2.4" xChannelSelector="R" yChannelSelector="G" result="d"/>
+      <feTurbulence type="fractalNoise" baseFrequency="0.28" numOctaves="3" seed="11" result="n2"/>
+      <feColorMatrix in="n2" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 -2.4 1.95" result="m"/>
+      <feComposite in="d" in2="m" operator="in"/>
+    </filter>
+    <symbol id="i-cross" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#cf3a2c"/><path d="M13 6h6v7h7v6h-7v7h-6v-7H6v-6h7z" fill="#fbf6ea"/></symbol>
+    <symbol id="i-motif" viewBox="0 0 64 52">
+      <circle cx="47" cy="13" r="6.5" fill="none" stroke="currentColor" stroke-width="1.6"/>
+      <path d="M0 40 L13 24 L19 29 L30 11 L41 28 L48 22 L64 37" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+      <path d="M26 17 L30 11 L34 17 L31 15.5 L29 18 Z" fill="currentColor"/>
+      <path d="M0 45 q5 -3.5 10.7 0 t10.7 0 t10.7 0 t10.7 0 t10.7 0 t10.7 0 M4 50 q5 -3.5 10.7 0 t10.7 0 t10.7 0 t10.7 0 t10.7 0" fill="none" stroke="currentColor" stroke-width="1.3"/>
+      <path d="M21 39 q6 -11 17 -7 q-3 3 -2 6 q-5 -3 -10 2 l-2 -3 l-3 2 z" fill="currentColor"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div id="loading">
+  <svg class="poster-art" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMax slice" aria-hidden="true"><circle cx="1180" cy="250" r="190" fill="#f8e4a8" opacity=".55"/><circle cx="1180" cy="250" r="118" fill="#f6d27a"/><path fill="#9ab7c1" d="M0 560L90 470L170 505L300 372L390 440L470 398L560 470L650 360L720 410L800 330L870 400L930 380L1000 440L1080 405L1190 470L1290 380L1370 430L1460 335L1540 400L1600 370L1600 640L0 640Z"/><path fill="#f6f1e3" d="M90 470L158 500L135 523L112 499L89 530L66 505L43 517ZM300 372L364 420L341 435L319 413L297 440L275 413L253 420ZM470 398L528 444L503 465L478 434L452 459L427 428L402 434ZM650 360L703 398L687 414L670 393L653 416L636 392L619 398ZM800 330L849 379L829 394L810 372L790 399L771 373L751 379ZM930 380L990 431L967 446L945 409L923 428L901 396L879 397ZM1080 405L1149 446L1121 458L1094 433L1067 463L1039 431L1012 435ZM1290 380L1350 418L1330 439L1309 412L1289 437L1268 410L1248 418ZM1460 335L1528 390L1504 406L1480 381L1455 413L1431 385L1407 391Z"/><path fill="#28465a" opacity=".16" d="M90 470L170 505L150 640L96 640ZM300 372L390 440L368 640L306 640ZM470 398L560 470L538 640L476 640ZM650 360L720 410L703 640L656 640ZM800 330L870 400L853 640L806 640ZM930 380L1000 440L983 640L936 640ZM1080 405L1190 470L1163 640L1086 640ZM1290 380L1370 430L1350 640L1296 640ZM1460 335L1540 400L1520 640L1466 640Z"/><path fill="#a9c3cb" d="M930 640L1010 520L1060 470L1095 380L1118 300L1132 248L1150 258L1162 300L1192 352L1240 420L1300 480L1390 560L1440 640Z"/><path fill="#f8f4e8" d="M1132 248L1150 258L1162 300L1192 352L1214 384L1188 380L1172 402L1150 372L1128 396L1110 368L1092 392L1095 380L1118 300Z"/><path fill="#28465a" opacity=".2" d="M1132 248L1150 258L1162 300L1192 352L1240 420L1300 480L1390 560L1440 640L1160 640L1150 420Z"/><path fill="#5f8c7a" d="M0 595L20 595L40 599L60 595L80 593L100 589L120 588L140 587L160 579L180 580L200 573L220 573L240 572L260 572L280 566L300 565L320 563L340 560L360 564L380 561L400 564L420 561L440 563L460 562L480 565L500 561L520 561L540 564L560 564L580 559L600 560L620 559L640 561L660 558L680 554L700 550L720 550L740 544L760 540L780 536L800 534L820 527L840 530L860 524L880 522L900 519L920 517L940 521L960 520L980 520L1000 519L1020 524L1040 527L1060 532L1080 536L1100 537L1120 542L1140 546L1160 550L1180 552L1200 560L1220 564L1240 571L1260 573L1280 572L1300 575L1320 580L1340 585L1360 581L1380 586L1400 583L1420 586L1440 584L1460 579L1480 580L1500 582L1520 579L1540 579L1560 575L1580 577L1600 574L1600 700L0 700Z"/><path fill="#2c5a46" d="M0 611L16 616L32 618L48 619L64 623L80 625L96 624L112 621L128 622L144 623L160 620L176 619L192 617L208 612L224 612L240 611L256 607L272 609L288 604L304 604L320 607L336 605L352 605L368 606L384 607L400 607L416 604L432 604L448 606L464 605L480 605L496 604L512 601L528 600L544 599L560 596L576 594L592 593L608 589L624 585L640 584L656 580L672 580L688 575L704 574L720 572L736 574L752 573L768 574L784 576L800 575L816 578L832 581L848 587L864 587L880 594L896 594L912 599L928 603L944 605L960 608L976 607L992 608L1008 612L1024 610L1040 610L1056 611L1072 610L1088 613L1104 611L1120 611L1136 609L1152 610L1168 609L1184 608L1200 610L1216 608L1232 608L1248 609L1264 612L1280 611L1296 615L1312 618L1328 619L1344 618L1360 620L1376 617L1392 619L1408 620L1424 616L1440 618L1456 612L1472 613L1488 608L1504 607L1520 603L1536 597L1552 594L1568 590L1584 585L1600 583L1600 720L0 720ZM4 592L8 601L6 601L9 609L7 609L10 618L-2 618L1 609L-1 609L2 601L0 601ZM14 573L21 591L18 591L24 605L20 605L26 621L2 621L8 605L4 605L10 591L7 591ZM30 585L35 599L33 599L37 610L34 610L39 623L20 623L25 610L22 610L27 599L24 599ZM41 576L48 594L45 594L51 608L47 608L53 624L30 624L36 608L32 608L38 594L34 594ZM51 580L58 597L55 597L61 611L57 611L62 626L40 626L46 611L42 611L48 597L45 597ZM64 603L67 612L66 612L69 620L66 620L70 629L58 629L61 620L59 620L62 612L60 612ZM78 597L83 609L80 609L85 619L82 619L86 630L70 630L74 619L71 619L75 609L73 609ZM89 597L93 609L91 609L95 619L92 619L97 630L81 630L85 619L82 619L86 609L84 609ZM99 582L106 599L103 599L109 614L105 614L111 630L88 630L94 614L90 614L96 599L92 599ZM115 591L120 604L118 604L122 615L119 615L124 627L107 627L111 615L108 615L112 604L110 604ZM136 595L141 607L139 607L143 617L140 617L144 628L128 628L132 617L130 617L134 607L131 607ZM152 589L157 603L155 603L159 615L156 615L161 628L143 628L148 615L144 615L149 603L146 603ZM164 589L169 602L167 602L171 613L168 613L173 626L155 626L160 613L157 613L161 602L159 602ZM184 592L189 603L187 603L191 613L188 613L192 624L177 624L181 613L178 613L182 603L180 603ZM199 586L204 599L202 599L206 609L203 609L207 621L191 621L195 609L192 609L196 599L194 599ZM210 588L214 599L212 599L215 608L213 608L217 618L203 618L206 608L204 608L207 599L205 599ZM226 594L230 602L228 602L231 609L229 609L232 618L221 618L223 609L221 609L224 602L223 602ZM236 574L242 589L240 589L245 603L241 603L247 617L226 617L231 603L228 603L233 589L230 589ZM247 586L251 596L249 596L253 605L250 605L254 615L240 615L244 605L241 605L245 596L243 596ZM261 570L268 586L265 586L270 599L266 599L272 614L251 614L256 599L252 599L258 586L255 586ZM278 574L283 588L281 588L285 600L282 600L287 613L268 613L273 600L270 600L275 588L272 588ZM295 576L299 588L297 588L301 598L298 598L303 610L287 610L291 598L288 598L292 588L290 588ZM313 564L320 581L316 581L322 596L318 596L324 611L301 611L307 596L303 596L309 581L306 581ZM326 570L332 585L329 585L334 598L331 598L336 612L316 612L321 598L317 598L322 585L320 585ZM336 584L340 593L338 593L341 601L339 601L342 611L329 611L333 601L330 601L334 593L332 593ZM351 570L357 585L354 585L359 597L356 597L361 611L341 611L346 597L343 597L348 585L345 585ZM361 564L368 581L365 581L371 596L367 596L373 612L350 612L356 596L352 596L358 581L354 581ZM381 585L385 595L383 595L386 603L384 603L388 613L375 613L378 603L376 603L379 595L377 595ZM401 579L406 591L403 591L408 602L405 602L409 613L393 613L397 602L394 602L398 591L396 591ZM418 571L424 585L421 585L426 597L423 597L428 610L409 610L414 597L411 597L416 585L413 585ZM437 562L444 580L441 580L447 595L443 595L449 611L425 611L431 595L427 595L433 580L430 580ZM451 582L455 593L453 593L457 602L455 602L458 612L444 612L448 602L445 602L449 593L447 593ZM464 569L470 584L467 584L473 597L469 597L474 611L454 611L459 597L456 597L461 584L458 584ZM481 586L485 594L483 594L486 602L484 602L487 611L476 611L479 602L477 602L480 594L478 594ZM499 583L503 592L501 592L504 600L502 600L505 610L493 610L496 600L494 600L497 592L495 592ZM513 563L519 579L517 579L522 592L518 592L524 607L503 607L508 592L504 592L510 579L507 579ZM527 557L534 575L531 575L537 590L533 590L539 606L516 606L522 590L518 590L524 575L520 575ZM545 578L549 587L547 587L551 596L548 596L552 605L539 605L542 596L540 596L543 587L541 587ZM555 575L559 585L558 585L561 593L559 593L562 603L549 603L552 593L550 593L553 585L551 585ZM565 553L572 571L568 571L574 586L570 586L576 602L553 602L559 586L555 586L561 571L558 571ZM577 559L582 574L580 574L585 587L581 587L586 600L567 600L572 587L568 587L574 574L571 574ZM589 567L594 578L592 578L596 588L593 588L597 599L582 599L585 588L583 588L587 578L585 578ZM607 551L613 567L610 567L615 580L612 580L617 595L596 595L602 580L598 580L603 567L600 567ZM623 542L630 560L627 560L633 575L629 575L635 591L611 591L617 575L613 575L619 560L616 560ZM639 545L645 561L642 561L648 575L644 575L649 590L628 590L634 575L630 575L635 561L632 561ZM654 552L659 564L657 564L661 575L658 575L662 586L646 586L650 575L647 575L652 564L649 564ZM667 539L674 556L670 556L676 571L672 571L678 586L655 586L661 571L657 571L663 556L660 556ZM677 547L682 560L680 560L685 572L681 572L686 585L668 585L673 572L669 572L674 560L671 560ZM691 540L697 555L694 555L699 567L696 567L701 581L681 581L686 567L683 567L688 555L685 555ZM804 547L809 559L806 559L811 570L808 570L812 582L796 582L800 570L797 570L801 559L799 559ZM862 548L868 565L865 565L871 578L867 578L872 593L851 593L856 578L853 578L858 565L855 565ZM879 559L885 573L882 573L887 586L884 586L889 599L870 599L874 586L871 586L876 573L873 573ZM900 561L905 575L903 575L908 588L904 588L909 601L890 601L895 588L892 588L896 575L894 575ZM911 578L914 588L912 588L916 595L913 595L917 605L904 605L908 595L905 595L909 588L907 588ZM921 578L925 588L923 588L927 597L924 597L928 607L914 607L918 597L915 597L919 588L917 588ZM940 583L944 593L942 593L946 601L943 601L947 611L934 611L937 601L935 601L938 593L936 593ZM951 587L954 596L953 596L956 603L954 603L957 612L945 612L948 603L946 603L949 596L947 596ZM970 570L976 586L973 586L979 599L975 599L980 613L960 613L965 599L961 599L967 586L964 586ZM979 579L984 591L982 591L986 602L983 602L987 613L971 613L975 602L972 602L977 591L974 591ZM988 584L992 595L991 595L994 603L992 603L995 614L981 614L985 603L982 603L986 595L984 595ZM1007 582L1012 595L1010 595L1014 606L1011 606L1015 618L998 618L1003 606L1000 606L1004 595L1002 595ZM1016 592L1019 601L1018 601L1021 608L1019 608L1022 617L1010 617L1013 608L1011 608L1014 601L1013 601ZM1025 583L1030 595L1028 595L1032 605L1029 605L1033 616L1017 616L1022 605L1019 605L1023 595L1021 595ZM1040 592L1044 600L1042 600L1045 607L1043 607L1046 616L1035 616L1038 607L1036 607L1039 600L1037 600ZM1060 569L1067 586L1063 586L1069 601L1065 601L1071 617L1048 617L1054 601L1050 601L1056 586L1053 586ZM1072 583L1076 594L1074 594L1078 604L1075 604L1079 616L1064 616L1068 604L1065 604L1069 594L1067 594ZM1082 590L1086 599L1084 599L1088 608L1085 608L1089 618L1076 618L1079 608L1077 608L1080 599L1078 599ZM1091 584L1096 596L1094 596L1098 606L1095 606L1100 618L1083 618L1088 606L1085 606L1089 596L1087 596ZM1110 573L1116 589L1113 589L1118 602L1115 602L1120 617L1099 617L1104 602L1101 602L1106 589L1103 589ZM1123 570L1130 587L1127 587L1133 601L1129 601L1134 616L1112 616L1118 601L1114 601L1120 587L1117 587ZM1138 583L1142 595L1140 595L1144 604L1142 604L1145 615L1130 615L1134 604L1132 604L1136 595L1133 595ZM1154 575L1160 589L1157 589L1163 602L1159 602L1164 616L1145 616L1150 602L1146 602L1151 589L1149 589ZM1171 581L1176 593L1174 593L1178 603L1175 603L1179 615L1163 615L1167 603L1165 603L1169 593L1167 593ZM1189 578L1194 591L1192 591L1196 602L1193 602L1197 614L1180 614L1185 602L1182 602L1186 591L1184 591ZM1203 580L1208 593L1205 593L1210 603L1207 603L1211 615L1194 615L1199 603L1196 603L1200 593L1198 593ZM1223 582L1228 593L1226 593L1230 603L1227 603L1231 614L1216 614L1220 603L1217 603L1221 593L1219 593ZM1240 589L1243 598L1242 598L1245 606L1243 606L1246 615L1234 615L1237 606L1235 606L1238 598L1236 598ZM1256 590L1260 599L1258 599L1262 607L1259 607L1263 617L1250 617L1253 607L1251 607L1254 599L1253 599ZM1273 588L1277 598L1275 598L1279 607L1276 607L1280 618L1266 618L1270 607L1267 607L1271 598L1269 598ZM1292 577L1298 592L1295 592L1300 606L1297 606L1302 620L1281 620L1287 606L1283 606L1288 592L1286 592ZM1303 573L1310 591L1307 591L1313 606L1309 606L1315 622L1291 622L1297 606L1293 606L1299 591L1296 591ZM1317 591L1322 603L1320 603L1324 613L1321 613L1325 624L1309 624L1313 613L1310 613L1315 603L1312 603ZM1329 600L1332 609L1330 609L1333 616L1331 616L1334 625L1323 625L1326 616L1324 616L1327 609L1325 609ZM1348 597L1352 607L1350 607L1353 615L1351 615L1354 625L1342 625L1345 615L1343 615L1346 607L1344 607ZM1363 579L1370 596L1367 596L1373 610L1369 610L1374 626L1352 626L1358 610L1354 610L1360 596L1357 596ZM1383 596L1387 606L1385 606L1388 614L1386 614L1389 624L1376 624L1380 614L1377 614L1381 606L1379 606ZM1403 591L1408 603L1405 603L1410 614L1407 614L1411 625L1395 625L1399 614L1396 614L1400 603L1398 603ZM1418 590L1423 602L1421 602L1425 612L1422 612L1426 623L1411 623L1415 612L1412 612L1416 602L1414 602ZM1432 596L1435 606L1434 606L1437 614L1435 614L1438 623L1426 623L1429 614L1426 614L1430 606L1428 606ZM1441 593L1445 604L1443 604L1447 613L1444 613L1448 623L1434 623L1438 613L1435 613L1439 604L1437 604ZM1451 588L1455 599L1453 599L1457 609L1454 609L1458 620L1443 620L1447 609L1444 609L1448 599L1446 599ZM1467 582L1472 595L1470 595L1474 606L1471 606L1476 618L1459 618L1463 606L1460 606L1464 595L1462 595ZM1479 579L1484 593L1482 593L1486 604L1483 604L1488 617L1470 617L1475 604L1472 604L1476 593L1474 593ZM1496 570L1502 585L1499 585L1504 599L1501 599L1506 613L1485 613L1490 599L1487 599L1492 585L1489 585ZM1516 581L1520 592L1518 592L1521 600L1519 600L1522 610L1509 610L1512 600L1510 600L1514 592L1512 592ZM1530 578L1534 588L1532 588L1535 596L1533 596L1536 606L1524 606L1527 596L1525 596L1528 588L1526 588ZM1547 569L1552 580L1550 580L1554 590L1551 590L1555 601L1540 601L1544 590L1541 590L1545 580L1543 580ZM1558 558L1564 572L1561 572L1566 585L1563 585L1568 598L1549 598L1554 585L1550 585L1555 572L1552 572ZM1570 567L1574 577L1572 577L1576 586L1573 586L1577 595L1564 595L1567 586L1565 586L1568 577L1566 577ZM1587 562L1591 572L1589 572L1593 581L1590 581L1594 591L1580 591L1584 581L1582 581L1585 572L1583 572ZM1599 559L1603 569L1601 569L1605 578L1602 578L1606 589L1592 589L1596 578L1593 578L1597 569L1595 569Z"/><path fill="#8db463" d="M0 647L40 645L80 644L120 643L160 641L200 641L240 640L280 639L320 638L360 639L400 639L440 640L480 639L520 640L560 638L600 638L640 639L680 637L720 635L760 635L800 634L840 631L880 629L920 628L960 627L1000 625L1040 627L1080 627L1120 627L1160 628L1200 629L1240 633L1280 635L1320 637L1360 638L1400 641L1440 643L1480 646L1520 648L1560 650L1600 649L1600 900L0 900Z"/><path fill="#76a050" d="M0 728L40 731L80 736L120 737L160 738L200 738L240 741L280 741L320 740L360 741L400 738L440 738L480 734L520 732L560 732L600 731L640 727L680 726L720 724L760 724L800 726L840 726L880 723L920 724L960 725L1000 725L1040 725L1080 727L1120 724L1160 725L1200 724L1240 726L1280 721L1320 719L1360 719L1400 715L1440 712L1480 712L1520 709L1560 704L1600 704L1600 900L0 900Z"/><path fill="#3f97a8" d="M781 630L781 632L782 636L784 639L785 644L787 648L788 652L790 657L791 662L792 667L792 673L792 678L791 683L789 689L787 695L783 701L778 706L772 713L765 719L756 725L746 731L735 737L722 744L708 750L693 757L677 764L660 770L641 777L622 784L602 791L581 798L560 805L539 812L518 819L497 826L475 833L455 841L435 848L415 856L397 863L379 870L363 878L347 886L334 893L321 901L310 909L300 916L292 924L285 932L963 932L941 924L922 916L904 909L889 901L875 893L864 886L855 878L847 870L841 863L837 856L835 848L833 841L833 833L834 826L836 819L839 812L842 805L845 798L849 791L853 784L856 777L860 770L863 764L865 757L867 750L869 744L869 737L869 731L868 725L867 719L865 713L862 706L858 701L854 695L850 689L845 683L840 678L835 673L829 667L824 662L819 657L814 652L810 648L807 644L803 639L801 636L800 632L799 630Z"/><path fill="#7cc7d3" d="M785 628L785 630L786 634L788 637L789 642L791 646L792 650L794 655L795 660L796 665L796 671L796 676L795 681L793 687L791 693L787 699L782 704L776 711L769 717L760 723L750 729L739 735L726 742L712 748L697 755L681 762L664 768L645 775L626 782L606 789L585 796L564 803L543 810L522 817L501 824L479 831L459 839L439 846L419 854L401 861L383 868L367 876L351 884L338 891L325 899L314 907L304 914L296 922L289 930L959 930L937 922L918 914L900 907L885 899L871 891L860 884L851 876L843 868L837 861L833 854L831 846L829 839L829 831L830 824L832 817L835 810L838 803L841 796L845 789L849 782L852 775L856 768L859 762L861 755L863 748L865 742L865 735L865 729L864 723L863 717L861 711L858 704L854 699L850 693L846 687L841 681L836 676L831 671L825 665L820 660L815 655L810 650L806 646L803 642L799 637L797 634L796 630L795 628Z"/><path fill="#d6f1f2" opacity=".85" d="M793 665L810 665L808 667L794 667ZM790 671L814 670L811 672L791 672ZM628 884L780 882L765 887L636 887ZM712 810L777 809L770 813L715 812ZM804 676L822 675L820 678L805 677ZM790 723L821 722L818 725L791 725ZM823 693L849 692L846 695L824 694ZM639 884L729 882L720 887L644 887ZM732 789L774 788L770 792L735 791ZM770 755L835 754L828 758L774 757ZM779 748L825 748L820 751L781 750ZM802 711L844 710L839 713L804 712ZM784 704L811 704L808 707L785 706ZM683 775L758 774L750 778L687 777ZM507 914L646 913L632 918L514 918ZM815 687L839 686L836 689L816 689ZM779 717L803 716L800 719L780 718ZM620 796L699 795L691 799L624 798ZM795 748L856 748L850 751L798 750ZM803 687L826 686L824 689L804 688ZM764 723L809 722L805 725L767 725ZM810 711L834 710L832 713L812 712ZM715 782L793 781L785 785L719 784ZM704 775L788 774L779 778L708 777ZM818 693L843 692L840 695L819 694ZM598 846L728 845L715 850L605 849Z"/><path fill="#1f4a37" d="M0 760L120 772L260 810L360 860L420 900L0 900ZM1600 735L1480 760L1360 812L1270 870L1240 900L1600 900ZM16 706L30 741L23 741L35 770L27 770L39 799L-7 799L5 770L-3 770L9 741L2 741ZM48 670L67 720L58 720L75 761L63 761L80 802L15 802L32 761L20 761L37 720L28 720ZM83 684L101 731L93 731L109 771L98 771L114 811L51 811L68 771L56 771L73 731L64 731ZM120 726L133 760L127 760L139 789L131 789L142 818L97 818L109 789L101 789L113 760L106 760ZM155 699L173 745L165 745L181 785L170 785L186 824L124 824L140 785L129 785L145 745L136 745ZM187 723L202 760L195 760L208 792L199 792L212 824L162 824L175 792L166 792L179 760L172 760ZM220 711L238 755L230 755L245 793L234 793L250 830L191 830L206 793L196 793L211 755L203 755ZM253 738L267 775L261 775L273 805L264 805L277 836L229 836L241 805L233 805L245 775L239 775ZM286 716L305 765L296 765L313 807L301 807L318 848L254 848L270 807L259 807L276 765L266 765ZM1578 670L1593 708L1586 708L1599 741L1590 741L1603 773L1553 773L1566 741L1557 741L1570 708L1563 708ZM1552 626L1575 686L1564 686L1585 736L1570 736L1591 785L1512 785L1533 736L1519 736L1539 686L1528 686ZM1508 673L1525 716L1517 716L1531 752L1521 752L1536 788L1480 788L1494 752L1484 752L1499 716L1491 716ZM1474 668L1493 715L1484 715L1500 755L1489 755L1505 794L1443 794L1460 755L1448 755L1464 715L1456 715ZM1433 683L1451 728L1443 728L1458 767L1447 767L1463 805L1403 805L1419 767L1408 767L1423 728L1415 728ZM1407 688L1425 735L1417 735L1433 775L1422 775L1438 814L1376 814L1392 775L1381 775L1397 735L1389 735ZM1360 714L1375 752L1368 752L1381 785L1372 785L1385 817L1335 817L1348 785L1339 785L1352 752L1345 752ZM1325 718L1341 759L1333 759L1347 793L1338 793L1351 826L1298 826L1312 793L1303 793L1316 759L1309 759Z"/><g transform="translate(770 760) scale(.72)">
+<path fill="#1d2b25" opacity=".25" d="M-70 9 Q0 16 70 6 L70 10 Q0 22 -70 13Z"/>
+<path fill="#b3202a" d="M-74 -6 Q-40 6 40 4 L66 -4 L72 -10 L70 -2 Q60 8 40 10 Q-30 12 -68 4Z"/>
+<path fill="#f3ead6" d="M-72 -5 Q-40 5 40 3 L66 -5 L66 -3 L40 5 Q-40 7 -72 -3Z"/>
+<path fill="#1d2b25" d="M-6 2 L-3 -26 L3 -26 L6 2Z"/>
+<circle fill="#1d2b25" cx="0" cy="-31" r="6"/>
+<path fill="#b3202a" d="M-7 -33 L7 -33 L5 -39 L-5 -39Z"/>
+<path fill="none" stroke="#1d2b25" stroke-width="2" stroke-linecap="round" d="M2 -20 L-46 -70"/>
+<path fill="none" stroke="#f6f1e3" stroke-width="1" opacity=".9" d="M-46 -70 Q-90 -60 -112 10"/>
+</g><g transform="translate(1418 708)"><rect x="-1.5" y="-70" width="3" height="72" fill="#1d2b25"/><rect x="1" y="-70" width="34" height="34" fill="#d0342c"/><path fill="#fff" d="M15 -63h6v7h7v6h-7v7h-6v-7h-7v-6h7z"/></g></svg>
+  <div class="poster-frame" aria-hidden="true"></div>
+  <div class="load-inner">
+    <div class="poster-kicker">Schweiz · Suisse · Svizzera · Svizra</div>
+    <h1 class="wordmark poster">Alpenfisch</h1>
+    <div class="poster-sub">Angling on the glacier river</div>
+  </div>
+  <div class="load-gauge">
+    <div class="load-board"><div id="load-fill"><i class="load-float"></i></div></div>
+    <div id="load-text">Carving the valley…</div>
+  </div>
+</div>
+
+<div id="menu" class="hidden">
+  <div class="menu-wrap">
+    <section class="licence paper">
+      <header class="lic-band">
+        <svg class="lic-cross" aria-hidden="true"><use href="#i-cross"/></svg>
+        <div class="lic-heading">
+          <div class="lic-title">Fischereipatent</div>
+          <div class="lic-langs">Permis de pêche · Licenza di pesca · Fishing licence</div>
+        </div>
+        <div class="lic-no">Nº&nbsp;0427</div>
+      </header>
+      <div class="lic-body">
+        <div class="lic-brand">
+          <div>
+            <h1 class="wordmark">Alpenfisch</h1>
+            <p class="tag">Big-river fishing in the Swiss Alps — alone or with friends</p>
+          </div>
+          <figure class="lic-photo" aria-hidden="true"><div class="fig"></div><figcaption>Salmo trutta</figcaption></figure>
+        </div>
+        <label class="field"><span class="field-lbl">Inhaber · Holder</span><input id="inp-name" maxlength="16" placeholder="Angler" autocomplete="off" spellcheck="false"></label>
+        <div class="row">
+          <button id="btn-solo" class="primary sign">Fish solo</button>
+          <button id="btn-host" class="sign">Host a lobby</button>
+        </div>
+        <div class="row join">
+          <label class="field code"><span class="field-lbl">Lobby code</span><input id="inp-code" maxlength="6" placeholder="ABCDE" autocomplete="off" spellcheck="false"></label>
+          <button id="btn-join" class="blue">Join</button>
+        </div>
+        <div id="menu-status" role="status"></div>
+      </div>
+      <svg class="lic-stamp" viewBox="0 0 120 120" aria-hidden="true">
+        <defs><path id="stamp-ring" d="M60 60 m-43 0 a43 43 0 1 1 86 0 a43 43 0 1 1 -86 0"/></defs>
+        <g filter="url(#ink-rough)">
+          <circle cx="60" cy="60" r="56" fill="none" stroke="currentColor" stroke-width="3.2"/>
+          <circle cx="60" cy="60" r="50.5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+          <circle cx="60" cy="60" r="34" fill="none" stroke="currentColor" stroke-width="1.2"/>
+          <text class="stamp-txt"><textPath href="#stamp-ring" textLength="268" lengthAdjust="spacing">FISCHEREIAUFSICHT ✦ ALPENFISCH ✦ 2026 ✦</textPath></text>
+          <text class="stamp-mid" x="60" y="56" text-anchor="middle">GÜLTIG</text>
+          <text class="stamp-mid small" x="60" y="72" text-anchor="middle">VALID</text>
+          <path d="M40 80 h40" stroke="currentColor" stroke-width="1.4"/>
+        </g>
+      </svg>
+      <footer class="lic-foot">Gewässer: Gletscherfluss · Saison 2026 · <span>Petri Heil!</span></footer>
+    </section>
+    <aside class="menu-help paper" aria-label="Controls">
+      <div class="mh-title">Merkblatt <span>· controls</span></div>
+      <dl>
+        <dt>Boat</dt><dd><kbd>W</kbd><kbd>S</kbd> throttle · <kbd>A</kbd><kbd>D</kbd> steer · <kbd>Q</kbd> anchor · <kbd>F</kbd> fishing mode</dd>
+        <dt>Ashore</dt><dd><kbd>E</kbd> at a bank or the dock · sell fish &amp; buy upgrades at the Fischerei</dd>
+        <dt>Fishing</dt><dd>hold <kbd>LMB</kbd> charge, release to cast · hold <kbd>LMB</kbd> reel · <kbd>RMB</kbd> strike / lift · <kbd>Wheel</kbd> drag · <kbd>1</kbd>–<kbd>4</kbd> lures · <kbd>E</kbd> net · <kbd>C</kbd> camera</dd>
+        <dt>Other</dt><dd><kbd>J</kbd> journal · <kbd>Enter</kbd> chat · <kbd>H</kbd> help · <kbd>Esc</kbd> release mouse</dd>
+      </dl>
+    </aside>
+  </div>
+</div>
+
+<div id="hud" class="hidden">
+  <div id="top-left">
+    <div id="wallet"></div>
+    <div id="lobby-badge" class="hidden"></div>
+    <div id="players"></div>
+  </div>
+  <div id="map-dial">
+    <canvas id="minimap" width="256" height="256"></canvas>
+    <span class="map-n" aria-hidden="true">N</span>
+  </div>
+  <div id="compass-wrap">
+    <div id="compass"><div id="compass-strip"></div><div class="compass-mark"></div></div>
+    <div id="mode-chip"></div>
+  </div>
+  <div id="prompt"></div>
+  <div id="notify"></div>
+  <div id="fish-panel" class="hidden instrument">
+    <div class="fp-head"><span class="fp-lbl">Line tension <i>Schnurzug</i></span><span id="fp-tension-val">0.0 kg</span></div>
+    <div class="meter tension"><div id="fp-tension"></div><div class="meter-mark" id="fp-drag-mark"></div></div>
+    <div class="scale-ticks"></div>
+    <div class="fp-read">
+      <div><span>Line out</span><b id="fp-line">0.0 m</b></div>
+      <div><span>Drag</span><b id="fp-drag">5</b></div>
+      <div><span>Depth</span><b id="fp-depth">0.0 m</b></div>
+    </div>
+    <div id="fp-fish-wrap" class="hidden">
+      <div class="fp-head"><span class="fp-lbl">Fish stamina</span></div>
+      <div class="meter fish"><div id="fp-stamina"></div></div>
+    </div>
+  </div>
+  <div id="cast-meter" class="hidden"><div id="cast-fill"></div><div class="cast-sweet"></div></div>
+  <div id="lure-bar"></div>
+  <div id="boat-panel" class="instrument">
+    <svg class="bp-dial" viewBox="0 0 100 100" aria-hidden="true">
+      <circle class="dial-face" cx="50" cy="50" r="47"/>
+      <path class="dial-red"/>
+      <g class="dial-ticks"></g>
+      <text class="dial-unit" x="50" y="83" text-anchor="middle">km/h</text>
+      <g class="dial-needle"><path d="M48.4 53 L50 13 L51.6 53 Z"/><circle cx="50" cy="50" r="5.2"/><circle class="hub" cx="50" cy="50" r="1.8"/></g>
+    </svg>
+    <div class="bp-read">
+      <div class="bp-speed"><b id="bp-speed">0.0</b><span>km/h</span></div>
+      <div class="bp-telegraph">
+        <div class="bp-throttle"><div id="bp-throttle-fill"></div><i class="bp-knob"></i></div>
+        <div class="bp-tlabels"><span>Rev</span><span>Stop</span><span>Full</span></div>
+      </div>
+      <div class="bp-flags"><span id="bp-anchor">Anchor up</span><span class="bp-cur"><span id="bp-current">0.0 m/s</span></span></div>
+    </div>
+  </div>
+  <div id="chat">
+    <div id="chat-log"></div>
+    <input id="chat-input" class="hidden" maxlength="140" placeholder="Say something… (Enter)">
+  </div>
+  <div id="crosshair"></div>
+</div>
+
+<div id="catch-card" class="hidden">
+  <div class="cc-inner paper">
+    <div class="cc-stamp" aria-hidden="true">
+      <div class="cc-stamp-face">
+        <span class="cc-helvetia">Helvetia</span>
+        <svg class="cc-motif"><use href="#i-motif"/></svg>
+        <b id="cc-points"></b>
+        <span class="cc-pts">Punkte · pts</span>
+      </div>
+    </div>
+    <svg class="cc-postmark" viewBox="0 0 120 80" aria-hidden="true">
+      <g filter="url(#ink-rough)" fill="none" stroke="currentColor">
+        <circle cx="32" cy="40" r="28" stroke-width="2"/>
+        <circle cx="32" cy="40" r="22.5" stroke-width="1"/>
+        <path d="M62 27 q7 -5 14 0 t14 0 t14 0 t14 0 M62 40 q7 -5 14 0 t14 0 t14 0 t14 0 M62 53 q7 -5 14 0 t14 0 t14 0 t14 0" stroke-width="2"/>
+        <text class="pm-town" x="32" y="31" text-anchor="middle" stroke="none" fill="currentColor">ALPENFISCH</text>
+        <text class="cc-date" x="32" y="44.5" text-anchor="middle" stroke="none" fill="currentColor"></text>
+        <text class="pm-town" x="32" y="56" text-anchor="middle" stroke="none" fill="currentColor">FANGPOST</text>
+      </g>
+    </svg>
+    <div class="cc-kicker">Specimen · <span>Fang</span></div>
+    <div class="cc-title" id="cc-title"></div>
+    <div class="cc-sub" id="cc-sub"></div>
+    <div class="cc-view" id="cc-view"></div>
+    <div class="cc-ruler"><div class="cc-ruler-fish"></div><div class="cc-ruler-marks"></div></div>
+    <div class="cc-stats">
+      <div><span>Length · Länge</span><b id="cc-len"></b></div>
+      <div><span>Weight · Gewicht</span><b id="cc-weight"></b></div>
+    </div>
+    <div class="cc-record" id="cc-record"></div>
+    <div class="row cc-actions">
+      <button id="btn-keep" class="sign green">Keep <kbd>K</kbd><small>into the crate</small></button>
+      <button id="btn-release" class="sign blue">Release <kbd>R</kbd><small>bonus points</small></button>
+    </div>
+  </div>
+</div>
+
+<div id="shop" class="hidden">
+  <div class="shop-inner">
+    <header class="shop-sign">
+      <div class="sign-brand">
+        <div class="sign-title">Fischerei</div>
+        <div class="shop-sub">Frischfisch · Bootsmotoren · Angelzubehör</div>
+      </div>
+      <div class="shop-wallet"><span>Your purse</span><b id="shop-money">CHF 0</b></div>
+    </header>
+    <div class="shop-cols">
+      <section class="ledger paper">
+        <h3>Ankauf <span>Sell your catch</span></h3>
+        <div class="ledger-head"><span>Fish</span><span>Size</span><span>CHF</span></div>
+        <div id="shop-catch"></div>
+        <button id="shop-sell" class="primary wide sign">Sell all</button>
+      </section>
+      <section class="board paper">
+        <h3>Werkstatt <span>Boat &amp; tackle upgrades</span></h3>
+        <div id="shop-upgrades"></div>
+        <div class="shop-note">Each motor upgrade gives your Weidling a fresh coat of paint, so everyone on the river can see it.</div>
+      </section>
+    </div>
+    <div class="row shop-foot"><button id="shop-close" class="ghost">Close <kbd>Esc</kbd></button></div>
+  </div>
+</div>
+
+<div id="journal" class="hidden">
+  <div class="j-inner notebook">
+    <div class="j-head">
+      <div class="j-title">Fangbuch <span>Angler's journal</span></div>
+      <div id="j-score"></div>
+    </div>
+    <div id="j-grid"></div>
+    <div class="j-foot">Press <kbd>J</kbd> to close</div>
+  </div>
+</div>
+
+<div id="help" class="hidden">
+  <div class="j-inner merkblatt paper">
+    <header class="mb-band">
+      <svg class="lic-cross" aria-hidden="true"><use href="#i-cross"/></svg>
+      <div><div class="mb-title">Merkblatt für Angler</div><div class="mb-sub">How to fish · Comment pêcher · Come pescare</div></div>
+    </header>
+    <ol>
+      <li><b>Find water.</b> Fish hold in seams beside fast current, behind boulders, in deep pools and slack water near banks. Drive with <kbd>W</kbd><kbd>S</kbd><kbd>A</kbd><kbd>D</kbd>, drop anchor with <kbd>Q</kbd>. The current is strong — upstream needs throttle.</li>
+      <li><b>Pick a lure</b> (<kbd>1</kbd>–<kbd>4</kbd>). Spinners and minnows trigger trout, huchen and pike; spoons tempt char and perch; the worm &amp; float drifts naturally for grayling, whitefish, barbel and chub.</li>
+      <li><b>Cast.</b> Press <kbd>F</kbd> for fishing mode. Hold left mouse to charge, release in the marked zone for a long cast. Press <kbd>Space</kbd> mid-flight to stop the line.</li>
+      <li><b>Retrieve.</b> Hold left mouse to reel. Watch the float or feel the rod tip twitch.</li>
+      <li><b>Strike!</b> When a fish bites, click right mouse quickly to set the hook.</li>
+      <li><b>Fight.</b> Reel when the fish rests, stop when it runs. Keep tension out of the red; adjust drag with the mouse wheel. Move the mouse sideways to apply side pressure against the fish's direction — it tires faster.</li>
+      <li><b>Land it.</b> When the fish is close and tired, press <kbd>E</kbd> to net it. Keep it (<kbd>K</kbd>) to sell, or release it (<kbd>R</kbd>) for bonus points.</li>
+      <li><b>Sell &amp; upgrade.</b> Steer to the dock or any bank and press <kbd>E</kbd> to go ashore. The Fischerei stall next to the dock buys your catch; spend the francs on faster outboards (each comes with a new hull colour) and braided line.</li>
+    </ol>
+    <div class="j-foot">Press <kbd>H</kbd> to close · <span>Petri Heil!</span></div>
+  </div>
+</div>
+
+<div id="cheat">
+  <input id="cheat-input" maxlength="8" autocomplete="off" spellcheck="false" aria-label="Code">
+  <div id="cheat-panel" class="hidden">
+    <label for="cheat-speed"><span>Boat speed</span><span id="cheat-speed-val">×1.0</span></label>
+    <input type="range" id="cheat-speed" min="0.5" max="8" step="0.1" value="1">
+    <div class="cheat-scale" aria-hidden="true"><span>×0.5</span><span>×8</span></div>
+  </div>
+</div>
+
+<script type="module" src="src/main.js"></script>
+</body>
+</html>

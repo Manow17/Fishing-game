@@ -1,0 +1,149 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tree preview</title>
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}canvas{display:block}#i{position:fixed;left:8px;top:8px;color:#fff;font:12px monospace;z-index:2}</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="i"></div>
+<canvas id="c"></canvas>
+<script type="module">
+// Same as world.html but exposes helpers to frame a tree and render on demand
+// (the preview pane may be hidden, which throttles requestAnimationFrame).
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { createRenderer, createComposer } from '../src/render.js';
+import { buildWorld } from '../src/world/world.js';
+import { centerX, waterY } from '../src/world/river.js';
+import { heightAt } from '../src/world/terrain.js';
+
+const renderer = createRenderer(document.getElementById('c'));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.08, 30000);
+const post = createComposer(renderer, scene, camera);
+const t0 = performance.now();
+const world = await buildWorld(scene, renderer, (p, m) => document.getElementById('i').textContent = m);
+const z = Number(new URLSearchParams(location.search).get('z') ?? -170);
+const x = centerX(z);
+camera.position.set(x - 20, waterY(z) + 4, z - 30);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(x, waterY(z), z + 20);
+world.updateReflections(camera.position, true);
+document.getElementById('i').textContent = `built in ${((performance.now() - t0) / 1000).toFixed(1)}s`;
+window.__cam = camera; window.__controls = controls; window.__world = world; window.__scene = scene; window.__renderer = renderer;
+window.__heightAt = heightAt;
+const clock = new THREE.Clock();
+window.__render = (n = 2, update = true) => {
+  for (let k = 0; k < n; k++) {
+    controls.update();
+    if (update) world.update(0.016, camera, controls.target);
+    post.render(0.016);
+  }
+  return renderer.info.render;
+};
+// Frame tree i from distance d (m), azimuth ang, eye height eh above the ground.
+window.__view = (i, d, ang = 0, eh = 1.7, lookH = 0.4) => {
+  const t = world.forest.trees[i];
+  const cx = t.x + Math.cos(ang) * d, cz = t.z + Math.sin(ang) * d;
+  camera.position.set(cx, heightAt(cx, cz) + eh, cz);
+  controls.target.set(t.x, t.y + t.h * lookH, t.z);
+  window.__render();
+  return { h: t.h, larch: t.larch, i };
+};
+window.__nearest = (px, pz, n = 10, filter = () => true) => world.forest.trees
+  .map((t, i) => ({ i, d: Math.hypot(t.x - px, t.z - pz), h: t.h, larch: t.larch })).filter(filter)
+  .sort((a, b) => a.d - b.d).slice(0, n);
+// Tree instanced meshes (near variants + far), triangle counts, atlas overlay.
+window.__treeMeshes = () => { const out = []; scene.traverse(o => { if (o.isInstancedMesh && o.geometry.getAttribute('aCard')) out.push(o); }); return out; };
+// Trees with a clear line of sight from distance d: returns [{i, ang}] (camera azimuth around the tree).
+window.__isolated = (d = 16, maxFromCam = 400, n = 20, spruceOnly = true) => {
+  const T = world.forest.trees, G = new Map(), cs = 20;
+  T.forEach((t, i) => { const k = Math.floor(t.x / cs) + ',' + Math.floor(t.z / cs); if (!G.has(k)) G.set(k, []); G.get(k).push(i); });
+  const near = (x, z, r) => { const out = []; for (let a = Math.floor((x - r) / cs); a <= Math.floor((x + r) / cs); a++) for (let b = Math.floor((z - r) / cs); b <= Math.floor((z + r) / cs); b++) for (const i of (G.get(a + ',' + b) || [])) { const t = T[i]; if ((t.x - x) ** 2 + (t.z - z) ** 2 < r * r) out.push(i); } return out; };
+  const res = [];
+  for (let i = 0; i < T.length && res.length < n; i++) {
+    const t = T[i];
+    if (spruceOnly && t.larch) continue;
+    if (Math.hypot(t.x - camera.position.x, t.z - camera.position.z) > maxFromCam) continue;
+    if (near(t.x, t.z, 7).length > 1) continue;
+    for (let k = 0; k < 12; k++) {
+      const ang = k / 12 * Math.PI * 2;
+      let ok = true;
+      for (let s = 0.3; s <= 1.0 && ok; s += 0.05) if (near(t.x + Math.cos(ang) * d * s, t.z + Math.sin(ang) * d * s, 5 + s * 3).some(j => j !== i)) ok = false;
+      if (ok) { res.push({ i, ang, h: t.h }); break; }
+    }
+  }
+  return res;
+};
+window.__tris = () => window.__treeMeshes().map(m => ({ tris: (m.geometry.index ? m.geometry.index.count : m.geometry.attributes.position.count) / 3, verts: m.geometry.attributes.position.count, count: m.count }));
+window.__atlas = (show = true, level = 0, bg = '#7a9', zoom = null, ox = 0, oy = 0) => {
+  let cv = document.getElementById('atlas');
+  if (!show) { if (cv) cv.remove(); return; }
+  const tex = window.__treeMeshes()[0].material.map;
+  const mm = tex.mipmaps[level];
+  if (!cv) { cv = document.createElement('canvas'); cv.id = 'atlas'; document.body.appendChild(cv); }
+  const sz = zoom ? `${mm.width * zoom}px` : '100vh';
+  cv.style.cssText = `position:fixed;left:${-ox * (zoom || 1)}px;top:${-oy * (zoom || 1)}px;width:${sz};height:${sz};z-index:3;image-rendering:pixelated`;
+  cv.width = mm.width; cv.height = mm.height;
+  const c2 = cv.getContext('2d');
+  c2.fillStyle = bg; c2.fillRect(0, 0, cv.width, cv.height);
+  const id = new ImageData(new Uint8ClampedArray(mm.data), mm.width, mm.height);
+  const tmp = document.createElement('canvas'); tmp.width = mm.width; tmp.height = mm.height; tmp.getContext('2d').putImageData(id, 0, 0);
+  c2.drawImage(tmp, 0, 0);
+};
+// LOD comparison: mode 'near' assigns LODs as if the viewer stood at `center`, 'far' forces every tree
+// to the far LOD; renders without the normal per-frame refresh.
+window.__lod = (mode, center) => {
+  window.__frozen = true;
+  world.sky.follow(camera.position);   // shadows around the viewer, as in the game
+  if (mode === 'far') world.forest.refresh(new THREE.Vector3(1e7, 0, 1e7));
+  else { world.forest.refresh(new THREE.Vector3(1e7, 0, -1e7)); world.forest.refresh(center); }
+  window.__render(1, false);
+};
+// Average colour / coverage of the trees alone (everything else hidden, black background).
+window.__measure = (mode, center) => {
+  const gl = renderer.getContext(), trees = new Set(window.__treeMeshes()), hidden = [];
+  scene.traverse(o => { if ((o.isMesh || o.isPoints || o.isLine) && !trees.has(o) && o.visible) { o.visible = false; hidden.push(o); } });
+  const bg = scene.background; scene.background = new THREE.Color(0, 0, 0);
+  window.__lod(mode, center);
+  const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight, px = new Uint8Array(w * h * 4);
+  gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  let n = 0, r = 0, g = 0, b = 0;
+  for (let i = 0; i < w * h; i++) { const a = px[i * 4], c = px[i * 4 + 1], d = px[i * 4 + 2]; if (a + c + d > 6) { n++; r += a; g += c; b += d; } }
+  hidden.forEach(o => o.visible = true); scene.background = bg;
+  return { cover: +(n / (w * h)).toFixed(4), r: +(r / n).toFixed(1), g: +(g / n).toFixed(1), b: +(b / n).toFixed(1) };
+};
+// Hide every tree farther than r from (cx, cz) (preview only; restored by __unisolate).
+window.__isolate = (cx, cz, r) => { for (const t of world.forest.trees) { if (t._y0 === undefined) t._y0 = t.y; t.y = Math.hypot(t.x - cx, t.z - cz) < r ? t._y0 : t._y0 - 5000; } };
+window.__unisolate = () => { for (const t of world.forest.trees) if (t._y0 !== undefined) t.y = t._y0; };
+// Near vs far LOD of the same trees ~340 m away, seen from 70 m up (fov 14 = magnified, 60 = game view).
+window.__lodTest = () => {
+  const a = 124 * Math.PI / 180, tx = 16.7 + Math.cos(a) * 340, tz = -200 + Math.sin(a) * 340, ty = heightAt(tx, tz) + 10;
+  window.__isolate(tx, tz, 250);
+  const out = {};
+  for (const fov of [14, 60]) {
+    window.__look(16.7, heightAt(16.7, -200) + 70, -200, tx, ty, tz, fov);
+    out[fov] = { near: window.__measure('near', new THREE.Vector3(tx, 0, tz)), far: window.__measure('far') };
+  }
+  window.__unisolate();
+  return out;
+};
+window.__look = (px, py, pz, tx, ty, tz, fov = 60) => { camera.position.set(px, py, pz); controls.target.set(tx, ty, tz); camera.fov = fov; camera.updateProjectionMatrix(); window.__render(2); };
+renderer.setAnimationLoop(() => {
+  if (window.__frozen) return;
+  const dt = Math.min(clock.getDelta(), 0.05);
+  controls.update();
+  world.update(dt, camera, controls.target);
+  post.render(dt);
+});
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); post.setSize(innerWidth, innerHeight); });
+</script>
+</body>
+</html>

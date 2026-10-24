@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>World preview</title>
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}canvas{display:block}#i{position:fixed;left:8px;top:8px;color:#fff;font:12px monospace;z-index:2}</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="i"></div>
+<canvas id="c"></canvas>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { createRenderer, createComposer } from '../src/render.js';
+import { buildWorld } from '../src/world/world.js';
+import { centerX, waterY } from '../src/world/river.js';
+
+const renderer = createRenderer(document.getElementById('c'));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.08, 30000);
+const post = createComposer(renderer, scene, camera);
+const t0 = performance.now();
+const world = await buildWorld(scene, renderer, (p, m) => document.getElementById('i').textContent = m);
+const z = Number(new URLSearchParams(location.search).get('z') ?? -170);
+const x = centerX(z);
+const view = new URLSearchParams(location.search).get('v') || 'low';
+if (view === 'high') camera.position.set(x - 120, waterY(z) + 70, z - 160);
+else camera.position.set(x - 20, waterY(z) + 4, z - 30);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(x, waterY(z), z + 20);
+world.updateReflections(camera.position, true);
+document.getElementById('i').textContent = `built in ${((performance.now() - t0) / 1000).toFixed(1)}s`;
+window.__cam = camera; window.__controls = controls; window.__world = world;
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  controls.update();
+  world.update(dt, camera, controls.target);
+  post.render(dt);
+});
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); post.setSize(innerWidth, innerHeight); });
+</script>
+</body>
+</html>

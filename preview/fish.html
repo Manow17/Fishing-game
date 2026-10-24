@@ -1,0 +1,168 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Fish preview</title>
+<style>
+html,body{margin:0;height:100%;background:#8fb3d9;overflow:hidden;font-family:system-ui,sans-serif}
+canvas{display:block}
+#ui{position:fixed;left:10px;top:10px;background:rgba(10,25,35,.72);color:#e8f2f4;padding:10px 12px;border-radius:8px;font-size:13px;line-height:1.7;max-width:270px}
+#ui button,#ui select{font:inherit;margin:2px 2px 2px 0;padding:2px 8px;border-radius:5px;border:1px solid #6a8a96;background:#1d3a46;color:#e8f2f4;cursor:pointer}
+#ui button.on{background:#3f8fa6}
+#ui input[type=range]{width:120px;vertical-align:middle}
+.lbl{position:fixed;transform:translate(-50%,0);color:#fff;font-size:12px;text-align:center;text-shadow:0 1px 3px #000;pointer-events:none;white-space:nowrap}
+.lbl b{font-size:13px}
+#stats{position:fixed;right:10px;bottom:10px;color:#fff;font-size:11px;text-shadow:0 1px 2px #000}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <div><b>Alpenfisch — fish</b></div>
+  <div><button id="bStruggle">Struggle</button><button id="bRotate">Rotate</button><button id="bWater">Water</button></div>
+  <div>Speed <input id="rSpeed" type="range" min="0" max="1" step="0.01" value="0.25"> <span id="vSpeed"></span></div>
+  <div>Turn&nbsp;&nbsp; <input id="rTurn" type="range" min="-1" max="1" step="0.01" value="0"> <span id="vTurn"></span></div>
+  <div>View <select id="sMode"><option value="grid">All species</option></select></div>
+  <div><button data-cam="side">Side</button><button data-cam="top">Top</button><button data-cam="front">Front</button><button data-cam="three">3/4</button></div>
+</div>
+<div id="stats"></div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { createFish, FISH_SPECIES, FISH_INFO, fishTriangleCount } from '../src/models/fish.js';
+
+const Q = new URLSearchParams(location.search);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const BG_AIR = new THREE.Color(0x8fb3d9), BG_WATER = new THREE.Color(0x2f7f86);
+scene.background = BG_AIR.clone();
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.6;
+const sun = new THREE.DirectionalLight(0xfff1dd, 3); sun.position.set(2.5, 6, 4); sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048); Object.assign(sun.shadow.camera, { left: -3, right: 3, top: 3, bottom: -3, near: 0.5, far: 20 });
+scene.add(sun);
+scene.add(new THREE.HemisphereLight(0xbfd8ff, 0x5a4a30, 0.6));
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(30, 30), new THREE.MeshStandardMaterial({ color: 0xb8a888, roughness: 0.95 }));
+ground.rotation.x = -Math.PI / 2; ground.position.y = -0.45; ground.receiveShadow = true; scene.add(ground);
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.01, 500);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+const sel = document.getElementById('sMode');
+for (const id of FISH_SPECIES) { const o = document.createElement('option'); o.value = id; o.textContent = FISH_INFO[id].localName + ' (' + FISH_INFO[id].name + ')'; sel.appendChild(o); }
+
+let fishes = [], labels = [], mode = Q.get('sp') || 'grid';
+let struggle = Q.get('struggle') === '1', rotate = Q.get('rotate') !== '0', water = Q.get('water') === '1';
+let speed = Q.has('speed') ? +Q.get('speed') : 0.25, turn = Q.has('turn') ? +Q.get('turn') : 0;
+const fixedAngle = Q.has('angle') ? +Q.get('angle') * Math.PI / 180 : null;
+document.getElementById('rSpeed').value = speed; document.getElementById('rTurn').value = turn;
+
+function clear() {
+  for (const f of fishes) f.dispose();
+  for (const l of labels) l.remove();
+  fishes = []; labels = [];
+}
+function label(html) { const d = document.createElement('div'); d.className = 'lbl'; d.innerHTML = html; document.body.appendChild(d); labels.push(d); return d; }
+
+function setCam(preset) {
+  if (mode === 'grid') {
+    const hf = Math.atan(Math.tan(20 * Math.PI / 180) * camera.aspect), d = Math.max(3.2, 2.25 / Math.tan(hf));
+    const P = { side: [0, 0.35, d], top: [0, d, 0.6], front: [d * 0.7, 0.6, d * 0.7], three: [d * 0.5, d * 0.4, d * 0.8] }[preset] || [0, 0.35, d];
+    camera.position.set(...P); controls.target.set(0, 0.35, 0);
+  } else {
+    const P = { side: [0, 0.05, 1.05], top: [0, 1.1, 0.05], front: [0.95, 0.12, 0.25], three: [0.55, 0.45, 0.85], head: [0.2, 0.03, 0.36], tail: [-0.2, 0.03, 0.4], below: [0.1, -0.7, 0.5] }[preset] || [0, 0.05, 1.05];
+    camera.position.set(...P); controls.target.set(preset === 'head' ? 0.2 : preset === 'tail' ? -0.2 : 0, 0, 0);
+  }
+  controls.update();
+}
+
+function build() { const T0 = performance.now(); try { build_(); } finally { window.__buildMs = performance.now() - T0; } }
+function build_() {
+  clear();
+  sel.value = mode;
+  if (Q.has('count')) { // stress test: N fish schooling
+    const n = +Q.get('count');
+    for (let i = 0; i < n; i++) {
+      const id = FISH_SPECIES[i % FISH_SPECIES.length], f = createFish(id, 0.3 + (i % 7) * 0.05, i);
+      f.object.position.set(((i % 8) - 3.5) * 0.6, Math.floor(i / 8) * 0.25 - 0.2, ((i * 37) % 11) * 0.12 - 0.6);
+      f.object.rotation.y = Math.PI / 2 + (i % 5) * 0.2; f.lbl = label(''); scene.add(f.object); fishes.push(f);
+    }
+    document.getElementById('stats').textContent = `fish: ${n}`;
+    setCam('side'); return;
+  }
+  if (mode === 'grid') {
+    FISH_SPECIES.forEach((id, i) => {
+      const f = createFish(id, 0.62, i * 7);
+      const col = i % 5, row = Math.floor(i / 5);
+      f.object.position.set((col - 2) * 0.86, row ? -0.05 : 0.75, 0);
+      f.object.rotation.y = Math.PI / 2;
+      f.phaseOff = i * 0.7;
+      scene.add(f.object); fishes.push(f);
+      f.lbl = label(`<b>${FISH_INFO[id].localName}</b><br>${FISH_INFO[id].name}`);
+    });
+  } else {
+    const f = createFish(mode, 0.62, +(Q.get('seed') || 0));
+    scene.add(f.object); fishes.push(f);
+    f.lbl = label(`<b>${FISH_INFO[mode].localName}</b> — ${FISH_INFO[mode].name}<br><i>${FISH_INFO[mode].latin}</i>`);
+    f.trophy = true;
+    if (Q.get('hook') === '1') f.mouth.add(new THREE.Mesh(new THREE.SphereGeometry(0.008), new THREE.MeshBasicMaterial({ color: 0xff0000 })));
+  }
+  const tri = fishes.map(f => fishTriangleCount(f.species));
+  document.getElementById('stats').textContent = `fish: ${fishes.length}  tris/fish: ${Math.min(...tri)}–${Math.max(...tri)}  draw calls/fish: 3 (+1 shadow)`;
+  setCam(Q.get('cam') || 'side');
+}
+
+const bS = document.getElementById('bStruggle'), bR = document.getElementById('bRotate'), bW = document.getElementById('bWater');
+const sync = () => { bS.classList.toggle('on', struggle); bR.classList.toggle('on', rotate); bW.classList.toggle('on', water); scene.background.copy(water ? BG_WATER : BG_AIR); scene.fog = water ? new THREE.FogExp2(0x2f7f86, 0.35) : null; };
+bS.onclick = () => { struggle = !struggle; sync(); };
+bR.onclick = () => { rotate = !rotate; sync(); };
+bW.onclick = () => { water = !water; sync(); };
+document.getElementById('rSpeed').oninput = (e) => speed = +e.target.value;
+document.getElementById('rTurn').oninput = (e) => turn = +e.target.value;
+sel.onchange = () => { mode = sel.value; build(); };
+document.querySelectorAll('[data-cam]').forEach(b => b.onclick = () => setCam(b.dataset.cam));
+addEventListener('keydown', (e) => { if (e.key === 's') bS.onclick(); if (e.key === 'r') bR.onclick(); });
+sync(); build();
+
+const clock = new THREE.Clock();
+const v = new THREE.Vector3();
+let elapsed = 0, frames = 0, acc = 0;
+renderer.setAnimationLoop(() => {
+  const rawDt = clock.getDelta(), dt = Math.min(rawDt, 0.05);
+  elapsed += dt; frames++; acc += rawDt;
+  if (acc > 1) { window.__fps = frames / acc; frames = 0; acc = 0; if (Q.has('count')) document.getElementById('stats').textContent = `fish: ${fishes.length}  fps: ${window.__fps.toFixed(0)}  calls: ${renderer.info.render.calls}  tris: ${renderer.info.render.triangles}`; }
+  document.getElementById('vSpeed').textContent = speed.toFixed(2);
+  document.getElementById('vTurn').textContent = turn.toFixed(2);
+  for (const f of fishes) {
+    f.setSwim(speed, turn);
+    f.setStruggle(struggle ? 1 : 0);
+    f.update(dt);
+    if (f.trophy) {
+      f.object.rotation.y = fixedAngle ?? (rotate ? elapsed * 0.35 : 0);
+      if (struggle) f.object.rotation.z = Math.sin(elapsed * 3.1) * 0.25;
+      else f.object.rotation.z = 0;
+    }
+    v.copy(f.object.position); v.y -= f.trophy ? 0.17 : 0.17; v.project(camera);
+    f.lbl.style.left = ((v.x * 0.5 + 0.5) * innerWidth) + 'px';
+    f.lbl.style.top = ((-v.y * 0.5 + 0.5) * innerHeight) + 'px';
+  }
+  controls.update();
+  renderer.render(scene, camera);
+});
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+window.__fish = { fishes, scene, camera, renderer, setCam };
+</script>
+</body>
+</html>

@@ -1,0 +1,155 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Village preview</title>
+<style>
+html,body{margin:0;height:100%;background:#9cc6e8;overflow:hidden;font:12px/1.35 system-ui,sans-serif}
+canvas{display:block}
+#ui{position:fixed;left:8px;top:8px;display:flex;flex-wrap:wrap;gap:4px;max-width:70vw}
+#ui button{border:0;border-radius:4px;padding:4px 8px;background:rgba(255,255,255,.85);cursor:pointer}
+#stats{position:fixed;right:8px;top:8px;background:rgba(0,0,0,.55);color:#fff;padding:6px 8px;border-radius:4px;white-space:pre;font-family:ui-monospace,monospace;font-size:11px}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui"></div>
+<div id="stats"></div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import {
+  createChalet, createBarn, createChurch, createDock, createCow, createFence,
+  createFlagPole, createHayBale, createBench, modelStats,
+} from '../src/models/village.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9cc6e8);
+scene.fog = new THREE.Fog(0x9cc6e8, 150, 700);
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.6;
+const sun = new THREE.DirectionalLight(0xfff1dd, 3);
+sun.position.set(60, 90, 40); sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+Object.assign(sun.shadow.camera, { left: -110, right: 110, top: 110, bottom: -110, near: 1, far: 300 });
+sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.04;
+scene.add(sun, sun.target);
+scene.add(new THREE.HemisphereLight(0xbfd8ff, 0x5a4a30, 0.6));
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 2000);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+// ---------------- ground + water ----------------
+const h = (x, z) => {
+  let y = (0.7 * Math.sin(x * 0.05) * Math.cos(z * 0.04) + 0.35 * Math.sin(z * 0.11 + x * 0.03));
+  y *= THREE.MathUtils.smoothstep(-x, -14, 10);
+  if (x > 16) y -= Math.min(3, (x - 16) * 0.45);
+  return y;
+};
+const params = new URLSearchParams(location.search);
+const solo = params.get('solo');
+function grassTex() {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d'); g.fillStyle = '#5f8f35'; g.fillRect(0, 0, 256, 256);
+  for (let i = 0; i < 9000; i++) { const v = Math.random(); g.fillStyle = v < 0.5 ? `rgba(40,80,20,${Math.random() * 0.4})` : `rgba(150,190,80,${Math.random() * 0.35})`; g.fillRect(Math.random() * 256, Math.random() * 256, 1.5, 3); }
+  const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(120, 120); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8; return t;
+}
+const gg = new THREE.PlaneGeometry(400, 400, 200, 200); gg.rotateX(-Math.PI / 2);
+const gp = gg.attributes.position;
+if (!solo) for (let i = 0; i < gp.count; i++) gp.setY(i, h(gp.getX(i), gp.getZ(i)));
+gg.computeVertexNormals();
+const ground = new THREE.Mesh(gg, new THREE.MeshStandardMaterial({ map: grassTex(), roughness: 0.95 }));
+ground.receiveShadow = true; scene.add(ground);
+const water = new THREE.Mesh(new THREE.PlaneGeometry(300, 400), new THREE.MeshStandardMaterial({ color: 0x2aa8a0, roughness: 0.12, metalness: 0.0, transparent: true, opacity: 0.88 }));
+water.rotation.x = -Math.PI / 2; water.position.set(solo ? 0 : 165, -0.6, 0); water.receiveShadow = true;
+if (!solo || solo.startsWith('dock')) scene.add(water);
+if (solo && solo.startsWith('dock')) ground.position.y = -4;
+
+// ---------------- placement ----------------
+const animated = [];
+const stats = {};
+function put(name, obj, x, z, ry = 0, yOff = 0) {
+  obj.position.set(x, (solo ? 0 : h(x, z)) + yOff, z); obj.rotation.y = ry; scene.add(obj);
+  const s = modelStats(obj); (stats[name.replace(/\d+$/, '')] ||= []).push(`${name}: ${s.tris} tris, ${s.calls} calls`);
+  return obj;
+}
+const t0 = performance.now();
+if (solo) {
+  const [kind, arg] = solo.split(':'); const n = Number(arg || 0);
+  const make = {
+    chalet: () => createChalet(n), barn: () => createBarn(n), church: () => createChurch(), dock: () => createDock(n || 14),
+    fence: () => createFence(n || 8), hay: () => createHayBale(n), bench: () => createBench(),
+    cow: () => { const c = createCow(n); animated.push(c); return c.object; },
+    flag: () => { const c = createFlagPole(arg || 'swiss'); animated.push(c); return c.object; },
+  }[kind];
+  put(kind + (arg ?? ''), make(), 0, 0);
+} else {
+  const chalets = [[-6, -32], [-9, -9], [-6, 15], [-32, -22], [-34, 4], [-30, 30], [-58, -10], [-56, 18]];
+  chalets.forEach(([x, z], i) => put('chalet' + i, createChalet(i), x, z, Math.PI / 2 + (i % 3 - 1) * 0.12));
+  put('church', createChurch(), -48, 52, Math.PI / 2);
+  [[-22, -50], [-78, -32], [-80, 40]].forEach(([x, z], i) => put('barn' + i, createBarn(i), x, z, Math.PI / 2 + i * 0.3));
+  put('dock', createDock(14), 18.2, 2, Math.PI / 2, -h(18.2, 2));
+  const flag = createFlagPole('swiss'); animated.push(flag); put('flag', flag.object, 13.5, -3);
+  const flag2 = createFlagPole('canton'); animated.push(flag2); put('flagCanton', flag2.object, -38, 44);
+  [[-14, 44, 0.3], [-20, 58, 2.2], [-26, 47, 4.0], [-12, 64, 1.0], [-30, 62, 5.3], [-6, 30, 2.8]].forEach(([x, z, r], i) => {
+    const c = createCow(i); animated.push(c); put('cow' + i, c.object, x, z, r);
+  });
+  // pasture fences
+  put('fence0', createFence(40), -2, 36);
+  put('fence1', createFence(36), -38, 36);
+  put('fence2', createFence(36), -2, 36, -Math.PI / 2);
+  put('fence3', createFence(12), 4, 0, 0);
+  [[-16, -44, 0], [-17, -47, 1], [-74, -24, 2], [-26, -56, 0]].forEach(([x, z, s], i) => put('hay' + i, createHayBale(s + i * 3), x, z, i));
+  put('bench0', createBench(), 12, 5, Math.PI / 2);
+  put('bench1', createBench(), -36, 50, Math.PI / 2);
+}
+const buildMs = performance.now() - t0;
+
+// ---------------- views ----------------
+const views = solo ? {
+  front: [[10, 6, 16], [0, 4, 0]], side: [[22, 8, -4], [0, 4, 0]], back: [[-14, 9, -16], [0, 4, 0]], close: [[5, 4, 7], [0, 3, 0]], low: [[14, 1.2, 10], [0, 4, 0]], cowclose: [[2.4, 1.6, 2.6], [0, 0.9, 0]],
+} : {
+  overview: [[70, 26, 12], [-20, 4, 5]], river: [[45, 2.5, 4], [-10, 5, 0]], riverFar: [[160, 6, 20], [-20, 6, 0]],
+  chalet: [[8, 5, -2], [-9, 4, -9]], dock: [[27, 2.8, 9], [17, 0, 3]], cows: [[-4, 3, 50], [-16, 0.8, 50]],
+  church: [[-20, 10, 70], [-48, 8, 52]], barn: [[-6, 5, -42], [-22, 3, -50]], village: [[-5, 40, 80], [-30, 0, 0]],
+};
+function view(name) { const v = views[name]; if (!v) return; camera.position.set(...v[0]); controls.target.set(...v[1]); controls.update(); }
+window.view = view;
+Object.assign(window, { camera, controls, scene, renderer });
+window.cam = (px, py, pz, tx, ty, tz) => { camera.position.set(px, py, pz); controls.target.set(tx, ty, tz); controls.update(); };
+const ui = document.getElementById('ui');
+Object.keys(views).forEach((k) => { const bt = document.createElement('button'); bt.textContent = k; bt.onclick = () => view(k); ui.appendChild(bt); });
+view(params.get('view') || Object.keys(views)[0]);
+
+const statsEl = document.getElementById('stats');
+const lines = Object.values(stats).flat();
+window.__stats = { models: stats, buildMs };
+const clock = new THREE.Clock();
+let frame = 0;
+renderer.setAnimationLoop(() => {
+  const dt = clock.getDelta(), t = clock.elapsedTime;
+  for (const a of animated) a.update(dt, t);
+  controls.update();
+  renderer.render(scene, camera);
+  if (frame++ % 30 === 0) {
+    window.__stats.render = { calls: renderer.info.render.calls, tris: renderer.info.render.triangles };
+    statsEl.textContent = `build ${buildMs.toFixed(0)} ms  |  frame: ${renderer.info.render.calls} calls, ${renderer.info.render.triangles} tris\n` + lines.join('\n');
+  }
+});
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+</script>
+</body>
+</html>
