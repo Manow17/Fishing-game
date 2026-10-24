@@ -49,7 +49,8 @@ export class BoatPhysics {
   }
 
   step(dt) {
-    const sub = Math.max(1, Math.ceil(dt / (1 / 120)));
+    // at least 120 Hz, and never more than 0.4 m per substep so very fast boats can't tunnel through banks
+    const sub = Math.min(160, Math.max(1, Math.ceil(dt / (1 / 120)), Math.ceil(this.speedOverGround * dt / 0.4)));
     const h = dt / sub;
     for (let i = 0; i < sub; i++) this._step(h);
     this.t += dt;
@@ -137,6 +138,9 @@ export class BoatPhysics {
     this.vx += (Fx / this.mass) * dt;
     this.vz += (Fz / this.mass) * dt;
     this.w += (tq / this.inertia) * dt;
+    // huge (cheat) thrust would otherwise spin the hull like a top
+    const wMax = 1.5;
+    if (this.w > wMax) this.w = wMax; else if (this.w < -wMax) this.w = -wMax;
     this.x += this.vx * dt;
     this.z += this.vz * dt;
     this.h += this.w * dt;
@@ -154,9 +158,15 @@ export class BoatPhysics {
       if (dep < minDepth) {
         let nx = ENV.depth(px + 1.5, pz) - ENV.depth(px - 1.5, pz);
         let nz = ENV.depth(px, pz + 1.5) - ENV.depth(px, pz - 1.5);
-        const gl = Math.hypot(nx, nz);
+        let gl = Math.hypot(nx, nz);
+        if (gl < 1e-4) {
+          // fully on dry land (depth is flat zero): head downhill, which leads back to the water
+          nx = ENV.groundY(px - 1.5, pz) - ENV.groundY(px + 1.5, pz);
+          nz = ENV.groundY(px, pz - 1.5) - ENV.groundY(px, pz + 1.5);
+          gl = Math.hypot(nx, nz);
+        }
         if (gl < 1e-4) { nx = -fx; nz = -fz; } else { nx /= gl; nz /= gl; }
-        const pen = (minDepth - dep) * 2.5 + 0.05;
+        const pen = (minDepth - dep) * 2.5 + 0.05 + (dep <= 0 ? 0.3 : 0);
         this.x += nx * pen * 0.5; this.z += nz * pen * 0.5;
         const vn = this.vx * nx + this.vz * nz;
         if (vn < 0) { this.vx -= nx * vn * 1.4; this.vz -= nz * vn * 1.4; this.bump = Math.max(this.bump, -vn); }
@@ -180,11 +190,12 @@ export class BoatPhysics {
         }
       }
     }
+    // map edges: a firm wall, so even a very fast boat stops at the edge
     const B = ENV.bounds;
-    if (this.z < B.z0) this.vz = Math.max(this.vz, 0) + (B.z0 - this.z) * 0.05;
-    if (this.z > B.z1) this.vz = Math.min(this.vz, 0) - (this.z - B.z1) * 0.05;
-    if (this.x < B.x0) this.vx = Math.max(this.vx, 0) + (B.x0 - this.x) * 0.05;
-    if (this.x > B.x1) this.vx = Math.min(this.vx, 0) - (this.x - B.x1) * 0.05;
+    if (this.z < B.z0) { this.z = B.z0; this.vz = Math.max(this.vz, 0); }
+    if (this.z > B.z1) { this.z = B.z1; this.vz = Math.min(this.vz, 0); }
+    if (this.x < B.x0) { this.x = B.x0; this.vx = Math.max(this.vx, 0); }
+    if (this.x > B.x1) { this.x = B.x1; this.vx = Math.min(this.vx, 0); }
   }
 
   serialize() { return [this.x, this.y, this.z, this.h, this.pitch, this.roll]; }

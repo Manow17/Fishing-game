@@ -227,18 +227,25 @@ export class Game {
     if (!root) {
       root = document.createElement('div');
       root.id = 'cheat';
-      root.innerHTML = '<input id="cheat-input" maxlength="8" autocomplete="off" spellcheck="false"><div id="cheat-panel" class="hidden"><label>Boat speed <span id="cheat-speed-val">×1.0</span><input type="range" id="cheat-speed" min="0.5" max="8" step="0.1" value="1"></label></div>';
+      root.innerHTML = '<input id="cheat-input" maxlength="8" autocomplete="off" spellcheck="false"><div id="cheat-panel" class="hidden"><label>Boat speed <span id="cheat-speed-val">×1.0</span><input type="range" id="cheat-speed" min="0" max="100" step="0.1" value="13.1"></label></div>';
       Object.assign(root.style, { position: 'fixed', right: '4px', bottom: '4px', zIndex: 60, pointerEvents: 'auto' });
       document.body.appendChild(root);
       Object.assign($('cheat-input').style, { width: '28px', height: '14px', opacity: 0.06, fontSize: '10px', background: 'transparent', border: '1px solid rgba(255,255,255,0.3)', color: '#fff' });
     }
     const inp = $('cheat-input'), panel = $('cheat-panel'), slider = $('cheat-speed'), val = $('cheat-speed-val');
+    // logarithmic dial: ×0.5 … ×100, with fine control around ×1
+    const MIN = 0.5, MAX = 100;
+    const toSpeed = (v) => MIN * (MAX / MIN) ** (v / 100);
+    const toSlider = (s) => 100 * Math.log(Math.min(MAX, Math.max(MIN, s)) / MIN) / Math.log(MAX / MIN);
+    const label = (s) => `×${s < 10 ? s.toFixed(1) : Math.round(s)}`;
+    Object.assign(slider, { min: 0, max: 100, step: 0.1 });
     const apply = (on, speed) => {
+      speed = Math.min(MAX, Math.max(MIN, +speed || 1));
       this.land.infinite = on;
       this.cheatSpeed = on ? speed : 1;
       panel.classList.toggle('hidden', !on);
-      slider.value = speed;
-      val.textContent = `×${(+speed).toFixed(1)}`;
+      slider.value = toSlider(speed);
+      val.textContent = label(speed);
       this.applyUpgrades();
       if (this.land.shopOpen) this.land.render();
       localStorage.setItem('af-cheat', JSON.stringify({ on, speed }));
@@ -255,7 +262,7 @@ export class Game {
       inp.value = '';
       if (code === '67') {
         const on = !this.land.infinite;
-        apply(on, on ? +slider.value || 1 : 1);
+        apply(on, on ? toSpeed(+slider.value) : 1);
         this.audio.purchase?.();
         this.hud.notify(on ? 'Cheats on: infinite francs and a speed dial for your boat' : 'Cheats off', true);
       } else {
@@ -264,10 +271,11 @@ export class Game {
       inp.blur();
     });
     slider.addEventListener('input', () => {
-      val.textContent = `×${(+slider.value).toFixed(1)}`;
-      this.cheatSpeed = +slider.value;
+      const speed = toSpeed(+slider.value);
+      val.textContent = label(speed);
+      this.cheatSpeed = speed;
       this.applyUpgrades();
-      localStorage.setItem('af-cheat', JSON.stringify({ on: true, speed: +slider.value }));
+      localStorage.setItem('af-cheat', JSON.stringify({ on: true, speed }));
     });
     // let the slider be dragged without the game grabbing keys
     slider.addEventListener('pointerdown', (e) => e.stopPropagation());
@@ -945,6 +953,9 @@ export class Game {
       const want = _v.set(bp.x - Math.sin(this.camYaw) * Math.cos(this.camPitch) * dist, bp.y + 1.4 + Math.sin(this.camPitch) * dist, bp.z - Math.cos(this.camYaw) * Math.cos(this.camPitch) * dist);
       const minY = ENV.surface(want.x, want.z) + 0.8;
       if (want.y < minY) want.y = minY;
+      // carry the camera with the boat first, so it never trails behind at high speed
+      if (this._camBoat && this._camBoat.distanceToSquared(bp) < 1e6) cam.position.add(_v2.copy(bp).sub(this._camBoat));
+      (this._camBoat ||= new THREE.Vector3()).copy(bp);
       cam.position.lerp(want, Math.min(1, dt * 10));
       cam.lookAt(bp.x, bp.y + 1.3, bp.z);
       if (cam.fov !== 60) { cam.fov = 60; cam.updateProjectionMatrix(); }
