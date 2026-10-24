@@ -27,15 +27,22 @@ canvas{display:block}
   <div><button id="bStruggle">Struggle</button><button id="bRotate">Rotate</button><button id="bWater">Water</button></div>
   <div>Speed <input id="rSpeed" type="range" min="0" max="1" step="0.01" value="0.25"> <span id="vSpeed"></span></div>
   <div>Turn&nbsp;&nbsp; <input id="rTurn" type="range" min="-1" max="1" step="0.01" value="0"> <span id="vTurn"></span></div>
-  <div>View <select id="sMode"><option value="grid">All species</option></select></div>
-  <div><button data-cam="side">Side</button><button data-cam="top">Top</button><button data-cam="front">Front</button><button data-cam="three">3/4</button></div>
+  <div>View <select id="sMode"></select></div>
+  <div><button data-cam="side">Side</button><button data-cam="top">Top</button><button data-cam="front">Front</button><button data-cam="three">3/4</button><button data-cam="head">Head</button><button data-cam="below">Below</button></div>
+  <div id="len" style="display:none">Length <input id="rLen" type="range" step="0.05"> <span id="vLen"></span> m</div>
 </div>
 <div id="stats"></div>
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { createFish, FISH_SPECIES, FISH_INFO, fishTriangleCount } from '../src/models/fish.js';
+import { createFish, FRESHWATER_SPECIES, OCEAN_SPECIES, FISH_INFO, fishTriangleCount } from '../src/models/fish.js';
+// URL params: sp=<id>|grid|ocean  cam=side|top|front|three|head|tail|below  angle=<deg>  speed  turn  struggle=1
+//             rotate=0  water=1  seed  len=<m> (ocean species are built at real size and shown at preview scale)
+//             hook=1 (red dot at the mouth/hook point)  count=<n> [&set=ocean] (stress test)
+// Console helpers (useful in hidden/background tabs, where requestAnimationFrame is throttled):
+//   __step(seconds)  advance the simulation;  await __snap()  freeze the current frame into a full-screen <img>;
+//   await __sheet([{ cam, angle, struggle, step }, ...])  contact sheet of several views in one image
 
 const Q = new URLSearchParams(location.search);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -46,7 +53,8 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
-const BG_AIR = new THREE.Color(0x8fb3d9), BG_WATER = new THREE.Color(0x2f7f86);
+const BG_AIR = new THREE.Color(0x8fb3d9), BG_WATER = new THREE.Color(0x2f7f86), BG_OCEAN = new THREE.Color(0x1b5c8c);
+const isOcean = (m) => m === 'ocean' || OCEAN_SPECIES.includes(m);
 scene.background = BG_AIR.clone();
 scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
 scene.environmentIntensity = 0.6;
@@ -61,23 +69,36 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 
 const sel = document.getElementById('sMode');
-for (const id of FISH_SPECIES) { const o = document.createElement('option'); o.value = id; o.textContent = FISH_INFO[id].localName + ' (' + FISH_INFO[id].name + ')'; sel.appendChild(o); }
+for (const [title, all, list] of [['Freshwater', 'grid', FRESHWATER_SPECIES], ['Open Ocean', 'ocean', OCEAN_SPECIES]]) {
+  const g = document.createElement('optgroup'); g.label = title; sel.appendChild(g);
+  const a = document.createElement('option'); a.value = all; a.textContent = `All ${title.toLowerCase()} species`; g.appendChild(a);
+  for (const id of list) { const o = document.createElement('option'); o.value = id; o.textContent = FISH_INFO[id].localName + ' (' + FISH_INFO[id].name + ')'; g.appendChild(o); }
+}
+const rLen = document.getElementById('rLen'), vLen = document.getElementById('vLen');
 
-let fishes = [], labels = [], mode = Q.get('sp') || 'grid';
+let fishes = [], labels = [], mode = Q.get('sp') || 'grid', lenM = Q.has('len') ? +Q.get('len') : null;
 let struggle = Q.get('struggle') === '1', rotate = Q.get('rotate') !== '0', water = Q.get('water') === '1';
 let speed = Q.has('speed') ? +Q.get('speed') : 0.25, turn = Q.has('turn') ? +Q.get('turn') : 0;
 const fixedAngle = Q.has('angle') ? +Q.get('angle') * Math.PI / 180 : null;
 document.getElementById('rSpeed').value = speed; document.getElementById('rTurn').value = turn;
 
 function clear() {
-  for (const f of fishes) f.dispose();
+  for (const f of fishes) { f.holder?.removeFromParent(); f.dispose(); }
   for (const l of labels) l.remove();
   fishes = []; labels = [];
 }
+// big fish are built at their real length (tail-beat tempo depends on it) and shown at preview scale
+const DISPLAY = 0.62;
+function makeFish(id, len, seed) {
+  const f = createFish(id, len, seed), holder = new THREE.Group();
+  holder.add(f.object); holder.scale.setScalar(DISPLAY / len); f.holder = holder;
+  return f;
+}
+const midLen = (id) => { const [a, b] = FISH_INFO[id].sizeRange; return +(a + (b - a) * 0.6).toFixed(2); };
 function label(html) { const d = document.createElement('div'); d.className = 'lbl'; d.innerHTML = html; document.body.appendChild(d); labels.push(d); return d; }
 
 function setCam(preset) {
-  if (mode === 'grid') {
+  if (mode === 'grid' || mode === 'ocean') {
     const hf = Math.atan(Math.tan(20 * Math.PI / 180) * camera.aspect), d = Math.max(3.2, 2.25 / Math.tan(hf));
     const P = { side: [0, 0.35, d], top: [0, d, 0.6], front: [d * 0.7, 0.6, d * 0.7], three: [d * 0.5, d * 0.4, d * 0.8] }[preset] || [0, 0.35, d];
     camera.position.set(...P); controls.target.set(0, 0.35, 0);
@@ -93,45 +114,61 @@ function build_() {
   clear();
   sel.value = mode;
   if (Q.has('count')) { // stress test: N fish schooling
-    const n = +Q.get('count');
+    const n = +Q.get('count'), set = Q.get('set') === 'ocean' ? OCEAN_SPECIES : FRESHWATER_SPECIES;
     for (let i = 0; i < n; i++) {
-      const id = FISH_SPECIES[i % FISH_SPECIES.length], f = createFish(id, 0.3 + (i % 7) * 0.05, i);
-      f.object.position.set(((i % 8) - 3.5) * 0.6, Math.floor(i / 8) * 0.25 - 0.2, ((i * 37) % 11) * 0.12 - 0.6);
-      f.object.rotation.y = Math.PI / 2 + (i % 5) * 0.2; f.lbl = label(''); scene.add(f.object); fishes.push(f);
+      const id = set[i % set.length], f = set === OCEAN_SPECIES ? makeFish(id, midLen(id), i) : createFish(id, 0.3 + (i % 7) * 0.05, i);
+      const o = f.holder || f.object;
+      o.position.set(((i % 8) - 3.5) * 0.6, Math.floor(i / 8) * 0.25 - 0.2, ((i * 37) % 11) * 0.12 - 0.6);
+      o.rotation.y = Math.PI / 2 + (i % 5) * 0.2; f.lbl = label(''); scene.add(o); fishes.push(f);
     }
     document.getElementById('stats').textContent = `fish: ${n}`;
     setCam('side'); return;
   }
-  if (mode === 'grid') {
-    FISH_SPECIES.forEach((id, i) => {
-      const f = createFish(id, 0.62, i * 7);
-      const col = i % 5, row = Math.floor(i / 5);
-      f.object.position.set((col - 2) * 0.86, row ? -0.05 : 0.75, 0);
-      f.object.rotation.y = Math.PI / 2;
+  document.getElementById('len').style.display = 'none';
+  if (mode === 'grid' || mode === 'ocean') {
+    const list = mode === 'ocean' ? OCEAN_SPECIES : FRESHWATER_SPECIES;
+    list.forEach((id, i) => {
+      const f = mode === 'ocean' ? makeFish(id, midLen(id), i * 7) : createFish(id, 0.62, i * 7);
+      const col = i % 5, row = Math.floor(i / 5), o = f.holder || f.object;
+      o.position.set((col - 2) * 0.86, row ? -0.05 : 0.75, 0);
+      o.rotation.y = Math.PI / 2;
       f.phaseOff = i * 0.7;
-      scene.add(f.object); fishes.push(f);
+      scene.add(o); fishes.push(f);
       f.lbl = label(`<b>${FISH_INFO[id].localName}</b><br>${FISH_INFO[id].name}`);
     });
   } else {
-    const f = createFish(mode, 0.62, +(Q.get('seed') || 0));
-    scene.add(f.object); fishes.push(f);
-    f.lbl = label(`<b>${FISH_INFO[mode].localName}</b> — ${FISH_INFO[mode].name}<br><i>${FISH_INFO[mode].latin}</i>`);
+    const ocean = OCEAN_SPECIES.includes(mode), seed = +(Q.get('seed') || 0);
+    let f;
+    if (ocean) {
+      const [a, b] = FISH_INFO[mode].sizeRange;
+      if (lenM == null || lenM < a || lenM > b) lenM = midLen(mode);
+      Object.assign(rLen, { min: a, max: b, value: lenM }); vLen.textContent = lenM.toFixed(2);
+      document.getElementById('len').style.display = '';
+      f = makeFish(mode, lenM, seed); scene.add(f.holder);
+    } else { f = createFish(mode, 0.62, seed); scene.add(f.object); }
+    fishes.push(f);
+    f.lbl = label(`<b>${FISH_INFO[mode].localName}</b> — ${FISH_INFO[mode].name}${ocean ? ` · ${lenM.toFixed(2)} m` : ''}<br><i>${FISH_INFO[mode].latin}</i>`);
     f.trophy = true;
     if (Q.get('hook') === '1') f.mouth.add(new THREE.Mesh(new THREE.SphereGeometry(0.008), new THREE.MeshBasicMaterial({ color: 0xff0000 })));
   }
-  const tri = fishes.map(f => fishTriangleCount(f.species));
-  document.getElementById('stats').textContent = `fish: ${fishes.length}  tris/fish: ${Math.min(...tri)}–${Math.max(...tri)}  draw calls/fish: 3 (+1 shadow)`;
+  const tri = fishes.map(f => fishTriangleCount(f.species)), calls = Object.keys(fishes[0].meshes).length;
+  document.getElementById('stats').textContent = `fish: ${fishes.length}  tris/fish: ${Math.min(...tri)}–${Math.max(...tri)}  draw calls/fish: ${calls} (+1 shadow)`;
   setCam(Q.get('cam') || 'side');
 }
+rLen.oninput = () => { lenM = +rLen.value; build(); };
 
 const bS = document.getElementById('bStruggle'), bR = document.getElementById('bRotate'), bW = document.getElementById('bWater');
-const sync = () => { bS.classList.toggle('on', struggle); bR.classList.toggle('on', rotate); bW.classList.toggle('on', water); scene.background.copy(water ? BG_WATER : BG_AIR); scene.fog = water ? new THREE.FogExp2(0x2f7f86, 0.35) : null; };
+const sync = () => {
+  bS.classList.toggle('on', struggle); bR.classList.toggle('on', rotate); bW.classList.toggle('on', water);
+  const wc = isOcean(mode) ? BG_OCEAN : BG_WATER;
+  scene.background.copy(water ? wc : BG_AIR); scene.fog = water ? new THREE.FogExp2(wc.getHex(), 0.35) : null;
+};
 bS.onclick = () => { struggle = !struggle; sync(); };
 bR.onclick = () => { rotate = !rotate; sync(); };
 bW.onclick = () => { water = !water; sync(); };
 document.getElementById('rSpeed').oninput = (e) => speed = +e.target.value;
 document.getElementById('rTurn').oninput = (e) => turn = +e.target.value;
-sel.onchange = () => { mode = sel.value; build(); };
+sel.onchange = () => { mode = sel.value; lenM = null; build(); sync(); };
 document.querySelectorAll('[data-cam]').forEach(b => b.onclick = () => setCam(b.dataset.cam));
 addEventListener('keydown', (e) => { if (e.key === 's') bS.onclick(); if (e.key === 'r') bR.onclick(); });
 sync(); build();
@@ -139,8 +176,11 @@ sync(); build();
 const clock = new THREE.Clock();
 const v = new THREE.Vector3();
 let elapsed = 0, frames = 0, acc = 0;
-renderer.setAnimationLoop(() => {
-  const rawDt = clock.getDelta(), dt = Math.min(rawDt, 0.05);
+renderer.setAnimationLoop(() => tick(clock.getDelta()));
+// advance the simulation by hand (hidden/background tabs throttle requestAnimationFrame)
+window.__step = (seconds = 1, dt = 1 / 60) => { for (let t = 0; t < seconds; t += dt) tick(dt); return elapsed; };
+function tick(rawDt) {
+  const dt = Math.min(rawDt, 0.05);
   elapsed += dt; frames++; acc += rawDt;
   if (acc > 1) { window.__fps = frames / acc; frames = 0; acc = 0; if (Q.has('count')) document.getElementById('stats').textContent = `fish: ${fishes.length}  fps: ${window.__fps.toFixed(0)}  calls: ${renderer.info.render.calls}  tris: ${renderer.info.render.triangles}`; }
   document.getElementById('vSpeed').textContent = speed.toFixed(2);
@@ -154,15 +194,47 @@ renderer.setAnimationLoop(() => {
       if (struggle) f.object.rotation.z = Math.sin(elapsed * 3.1) * 0.25;
       else f.object.rotation.z = 0;
     }
-    v.copy(f.object.position); v.y -= f.trophy ? 0.17 : 0.17; v.project(camera);
+    (f.holder || f.object).getWorldPosition(v); v.y -= 0.17; v.project(camera);
     f.lbl.style.left = ((v.x * 0.5 + 0.5) * innerWidth) + 'px';
     f.lbl.style.top = ((-v.y * 0.5 + 0.5) * innerHeight) + 'px';
   }
   controls.update();
   renderer.render(scene, camera);
-});
+}
 addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
-window.__fish = { fishes, scene, camera, renderer, setCam };
+window.__fish = { get fishes() { return fishes; }, scene, camera, renderer, setCam, build };
+// contact sheet: render several camera presets (and/or animation steps) into one frozen image
+// views: [{ cam: 'side', angle: deg, struggle: bool, step: seconds }]
+window.__sheet = async (views = [{ cam: 'side', angle: 90 }, { cam: 'three', angle: 90 }, { cam: 'front', angle: 90 }, { cam: 'three', angle: 90, struggle: true, step: 0.6 }], cols = 2) => {
+  const src = renderer.domElement, w = src.width, h = src.height, rows = Math.ceil(views.length / cols);
+  const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d');
+  const keep = { struggle, rotate };
+  views.forEach((vw, i) => {
+    struggle = !!vw.struggle; rotate = false; setCam(vw.cam || 'side');
+    for (const f of fishes) if (f.trophy) f.object.rotation.y = (vw.angle ?? 90) * Math.PI / 180;
+    window.__step(vw.step ?? 0.05);
+    for (const f of fishes) if (f.trophy) f.object.rotation.y = (vw.angle ?? 90) * Math.PI / 180;
+    renderer.render(scene, camera);
+    g.drawImage(src, (i % cols) * w / cols, Math.floor(i / cols) * h / rows, w / cols, h / rows);
+  });
+  struggle = keep.struggle; rotate = keep.rotate;
+  document.getElementById('snap')?.remove();
+  const img = document.createElement('img'); img.id = 'snap';
+  img.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;z-index:99;object-fit:contain;background:#000;cursor:pointer';
+  img.onclick = () => img.remove(); document.body.appendChild(img);
+  return new Promise((res) => { img.onload = () => setTimeout(() => res('ok'), 50); img.src = c.toDataURL(); setTimeout(() => res('timeout'), 1500); });
+};
+// freeze the current frame into a full-screen image (background tabs can return stale WebGL screenshots)
+window.__snap = (hideUi = true) => {
+  renderer.render(scene, camera);
+  document.getElementById('snap')?.remove(); // a fresh element forces a repaint even in a hidden tab
+  const img = document.createElement('img'); img.id = 'snap';
+  img.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;z-index:99;object-fit:contain;background:#000;cursor:pointer';
+  img.onclick = () => { img.remove(); document.getElementById('ui').style.visibility = ''; };
+  document.body.appendChild(img);
+  document.getElementById('ui').style.visibility = hideUi ? 'hidden' : '';
+  return new Promise((res) => { img.onload = () => setTimeout(() => res('ok'), 50); img.src = renderer.domElement.toDataURL(); img.style.display = ''; setTimeout(() => res('timeout'), 1500); });
+};
 </script>
 </body>
 </html>

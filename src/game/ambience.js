@@ -18,8 +18,17 @@
 //   insects : crickets and grasshoppers in the meadows, bees buzzing past (on land)
 //   village : cowbells on the pasture, church bells, a dog or rooster, a rare far-away alphorn
 // Foley for the on-land feature: footstep(surface), coins(), purchase(), shopBell().
+//
+// Ocean map (ENV.id === 'ocean'): the river, birdsong, insects and village are replaced by
+//   sea     : deep swell rumble, wash and spray that breathe with the waves under the listener and
+//             grow with ENV.waveScale; breakers and surf roar toward the nearest shore; hull slaps afloat
+//   wind    : stronger, gustier sea wind (more in a storm), apparent wind under way
+//   life    : herring gulls (busier near the harbour), cicadas in the island's pines on land,
+//             halyards clinking and ropes creaking in the harbour
+//   rare    : the bell buoy off the harbour mouth, a far-away foghorn
 import { centerX, halfWidth, waterY, rapids as rapidsAt } from '../world/river.js';
 import { SPAWN_Z, VILLAGE_SIDE, bankX } from '../world/layout.js';
+import { ENV } from '../world/env.js';
 
 const TAU = Math.PI * 2;
 const rand = (a, b) => a + Math.random() * (b - a);
@@ -29,6 +38,7 @@ const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const chance = (p) => Math.random() < p;
 const gauss = () => (Math.random() + Math.random() + Math.random() - 1.5) * 2;
 const sstep = (x) => x * x * (3 - 2 * x);
+const smoothstepN = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
 const expIv = (rate, lo, hi) => clamp(-Math.log(1 - Math.random()) / Math.max(1e-4, rate), lo, hi);
 
 // Distance cues, computed per voice (panners only do direction).
@@ -352,6 +362,7 @@ export class Ambience {
     dt = clamp(dt || 0, 0, 0.25);
     const now = ctx.currentTime;
     this._listener(s.camera);
+    if (ENV.id === 'ocean') { this._oceanUpdate(dt, now, s); return; }
     this._context(dt, s);
     if ((this._paramT -= dt) <= 0) { this._paramT = 0.1; this._mix(now); }
     if ((this._gcT -= dt) <= 0) { this._gcT = 0.25; this._sweep(now); }
@@ -1252,9 +1263,320 @@ export class Ambience {
     }
   }
 
+  // ================================================================ ocean
+  _oceanUpdate(dt, now, s) {
+    if (!this.ocean) this._oceanInit();
+    if (s.layout && s.layout !== this.layout) this.layout = s.layout;
+    this._oceanContext(dt, s);
+    if ((this._paramT -= dt) <= 0) { this._paramT = 0.1; this._oceanMix(now); }
+    if ((this._gcT -= dt) <= 0) { this._gcT = 0.25; this._sweep(now); }
+    if (!this.auto) return;
+    this._oceanLife(dt, now);
+  }
+
+  _oceanInit() {
+    const ctx = this.ctx, now = ctx.currentTime;
+    // silence the river beds for good (_mix() is not called on this map)
+    for (const k of ['deep', 'body', 'mid', 'hiss', 'shim', 'rLow', 'rMid', 'rHi', 'wash']) this.layers[k].g.gain.setTargetAtTime(0, now, 0.3);
+    this.riverSur.gain.setTargetAtTime(0, now, 0.3);
+    this.riverShore.gain.setTargetAtTime(0, now, 0.3);
+    this.bus.insects.gain.setTargetAtTime(1, now, 0.5);
+    const gain = (v) => { const g = ctx.createGain(); g.gain.value = v; return g; };
+    const src = (buf, rate) => {
+      const b = ctx.createBufferSource(); b.buffer = buf; b.loop = true; b.playbackRate.value = rate;
+      b.start(now, Math.random() * (buf.duration - 0.1)); return b;
+    };
+    const brown = src(this.noise.brown, rand(0.85, 1.0)), pink = src(this.noise.pink, rand(0.9, 1.05));
+    const pink2 = src(this.noise.pink, rand(0.7, 0.8)), white = src(this.noise.white, 1);
+    const layer = (s, type, f, q, dest) => {
+      const fl = ctx.createBiquadFilter(); fl.type = type; fl.frequency.value = f; fl.Q.value = q;
+      const g = gain(0); s.connect(fl); fl.connect(g); g.connect(dest); return { f: fl, g };
+    };
+    // the shore roar comes from the nearest coast
+    const surfPan = this._panner(false), surfIn = gain(1);
+    surfIn.connect(surfPan); surfPan.connect(this.bus.water);
+    const sv = gain(0.25); surfIn.connect(sv); sv.connect(this.verbIn);
+    // cicadas: a buzzing band of noise, amplitude-modulated
+    const cicAM = gain(0.5), cicLfo = ctx.createOscillator(), cicDepth = gain(0.5);
+    cicLfo.frequency.value = rand(38, 52); cicLfo.connect(cicDepth); cicDepth.connect(cicAM.gain); cicLfo.start();
+    const cicBP = ctx.createBiquadFilter(); cicBP.type = 'bandpass'; cicBP.frequency.value = rand(4800, 5600); cicBP.Q.value = 3.5;
+    const cicG = gain(0); white.connect(cicBP); cicBP.connect(cicAM); cicAM.connect(cicG); cicG.connect(this.bus.insects);
+    this.ocean = {
+      rumble: layer(brown, 'lowpass', 150, 0.7, this.bus.water),     // the deep body of the swell
+      wash: layer(pink, 'bandpass', 620, 0.7, this.bus.water),       // water moving round the boat
+      fizz: layer(white, 'bandpass', 4200, 0.6, this.bus.water),     // spray and breaking crests
+      bow: layer(pink2, 'bandpass', 950, 0.6, this.bus.water),       // bow wave under way
+      surf: layer(pink2, 'lowpass', 700, 0.6, surfIn),               // surf roar from the coast
+      surfHi: layer(white, 'bandpass', 2600, 0.5, surfIn),
+      surfPan, cicG,
+      land: 0, spd: 0, shoreD: 400, shoreP: { x: 0, y: 0, z: 0 }, onLand: false, harbourD: 1e4,
+      h: 0, hPrev: 0, dh: 0, breath: 0.5, scanT: 0,
+      cic: new Drift(0.6, 0.35, 6, 0, 1),
+      wind: new Drift(0.55, 0.12, 20, 0.25, 0.9), windF: new Drift(1, 0.15, 5, 0.7, 1.4),
+      wt: { lap: 1, breaker: rand(1, 4), gull: rand(2, 6), bell: rand(3, 8), foghorn: rand(90, 200), clink: rand(1, 4), creak: rand(3, 9) },
+    };
+  }
+
+  // where the listener is (afloat / ashore, distance to the coast and the harbour) and the sea under it
+  _oceanContext(dt, s) {
+    const O = this.ocean, L = this.L;
+    const k = (tau) => 1 - Math.exp(-dt / tau);
+    O.land += ((s.onLand ? 1 : 0) - O.land) * k(1.2);
+    O.spd += (Math.abs(s.speed || 0) - O.spd) * k(0.5);
+    if ((O.scanT -= dt) <= 0 && this.hasWorld) {
+      O.scanT = 0.5;
+      const here = ENV.groundY(L.x, L.z) > 0;
+      let best = 1e9, bx = L.x, bz = L.z;
+      for (let a = 0; a < 24; a++) {
+        const ang = a / 24 * TAU, ca = Math.cos(ang), sa = Math.sin(ang);
+        for (const r of [6, 15, 30, 55, 90, 140, 210, 320, 480]) {
+          if (r >= best) break;
+          const x = L.x + ca * r, z = L.z + sa * r;
+          if ((ENV.groundY(x, z) > 0) !== here) { best = r; bx = x; bz = z; break; }
+        }
+      }
+      O.onLand = here;
+      O.shoreD = Math.min(600, best);
+      O.shoreP = { x: bx, y: 1, z: bz };
+      const lay = this.layout, hm = lay && (lay.homeMark || (lay.docks && lay.docks[0]));
+      O.harbourD = hm ? Math.hypot(L.x - hm.x, L.z - hm.z) : 1e4;
+    }
+    // the sea beside the listener: its height and vertical speed make the swell "breathe"
+    O.hPrev = O.h;
+    O.h = this.hasWorld ? ENV.waveHeight(L.x, L.z, ENV.time || 0) : Math.sin(this.ctx.currentTime * 0.7) * 0.5;
+    if (!isFinite(O.h)) O.h = 0;
+    O.dh += (clamp((O.h - O.hPrev) / Math.max(1e-3, dt), -20, 20) - O.dh) * k(0.3);
+    // gusts (same shape as in the valley)
+    const G = this.gust;
+    if (G.phase === 0) {
+      G.v = 0;
+      if ((G.t -= dt) <= 0) Object.assign(G, { phase: 1, k: 0, amp: rand(0.3, 1), rise: rand(1.5, 4), hold: rand(0.5, 3), fall: rand(3, 8) });
+    } else {
+      G.k += dt;
+      let e;
+      if (G.k < G.rise) e = sstep(G.k / G.rise);
+      else if (G.k < G.rise + G.hold) e = 1;
+      else if (G.k < G.rise + G.hold + G.fall) e = 1 - sstep((G.k - G.rise - G.hold) / G.fall);
+      else { e = 0; G.phase = 0; G.t = rand(4, 18); }
+      G.v = G.amp * e;
+    }
+  }
+
+  _oceanMix(now) {
+    const O = this.ocean, T = (p, v, tau = 0.35) => p.setTargetAtTime(v, now, tau);
+    const on = this.beds ? 1 : 0;
+    const W = Math.max(0, ENV.waveScale ?? 1);
+    const sea = (0.18 + 0.82 * Math.min(1, W) + 0.4 * Math.max(0, W - 1)) * on;   // louder in a storm
+    const amp = Math.max(0.12, 0.75 * W);
+    const crest = clamp(O.h / amp, -1, 1), rise = clamp(O.dh / (amp * 0.9 + 0.1), -1.5, 1.5);
+    O.breath += ((0.5 + 0.35 * crest + 0.25 * Math.abs(rise)) - O.breath) * 0.4;
+    const afloat = 1 - O.land;
+    const inland = O.onLand ? clamp(O.shoreD / 120, 0, 1) : 0;          // ashore and away from the water
+    const open = 1 - 0.6 * inland;
+    O.wind.step(0.1); O.windF.step(0.1); O.cic.step(0.1);
+    T(O.rumble.g.gain, 0.15 * sea * open * (0.6 + 0.6 * O.breath), 0.25);
+    T(O.rumble.f.frequency, 120 + 80 * O.breath + 40 * Math.min(W, 3), 0.4);
+    T(O.wash.g.gain, 0.17 * sea * (0.25 + 0.75 * afloat) * (1 - inland) * (0.45 + 0.9 * O.breath), 0.2);
+    T(O.wash.f.frequency, 480 + 380 * O.breath, 0.3);
+    T(O.fizz.g.gain, 0.05 * sea * (1 - inland) * smoothstepN(0.4, 2.5, W) * (0.3 + O.breath), 0.2);
+    T(O.bow.g.gain, 0.15 * on * afloat * Math.pow(Math.min(1, O.spd / 9), 1.4), 0.3);
+    // surf: loud close to a beach or cliff, still audible a few hundred metres out
+    const near = Math.exp(-O.shoreD / 140) * (O.onLand ? 0.8 : 1);
+    T(O.surf.g.gain, 0.32 * sea * near * (0.55 + 0.6 * O.breath), 0.3);
+    T(O.surf.f.frequency, 380 + 900 * Math.exp(-O.shoreD / 60), 0.5);
+    T(O.surfHi.g.gain, 0.06 * sea * Math.exp(-O.shoreD / 50), 0.3);
+    this._setPos(O.surfPan, O.shoreP);
+    // sea wind: steadier and stronger than in the valley, howling in a storm; apparent wind under way
+    const g = this.gust.v, base = O.wind.v * (0.6 + 0.25 * Math.min(W, 3)), app = Math.min(0.7, O.spd / 12) * afloat;
+    const Ly = this.layers;
+    T(Ly.wLow.g.gain, K.wLow * on * ((base + 0.6 * g) * (0.7 + 0.5 * afloat) + app), 0.4);
+    T(Ly.wMid.g.gain, K.wMid * on * (base + 0.7 * g + 0.6 * app) * (1 - 0.3 * inland), 0.4);
+    T(Ly.wMid.f.frequency, (380 + 600 * g + 120 * Math.min(W, 3)) * O.windF.v, 0.6);
+    T(Ly.wHi.g.gain, K.wHi * on * (0.25 + 0.6 * smoothstepN(1.5, 4, W) + 0.5 * inland) * Math.pow(g, 1.5), 0.5);
+    T(Ly.wHi.f.frequency, 3000 + 2600 * g, 0.6);
+    // cicadas in the pines (only ashore, away from the surf)
+    const cic = O.land * smoothstepN(20, 70, O.shoreD) * (0.35 + 0.65 * O.cic.v) * (1 - 0.6 * g);
+    T(O.cicG.gain, 0.012 * cic * on, 0.8);
+  }
+
+  _oceanLife(dt, now) {
+    const O = this.ocean, W = Math.max(0, ENV.waveScale ?? 1), L = this.L, E = O.wt;
+    const busy = this.live.length > 40;
+    for (const k in E) E[k] -= dt;
+    const afloat = 1 - O.land;
+    // hull slaps: more and heavier in a bigger sea and under way
+    if (E.lap <= 0) {
+      const rate = afloat * (0.35 + 0.55 * Math.min(W, 3) + 0.4 * Math.min(1, O.spd / 6));
+      E.lap = rand(0.5, 2.2) / Math.max(0.2, rate);
+      if (afloat > 0.4 && !busy && rate > 0.05) this._lap(this._oHull(), 0.1 + 0.05 * Math.min(W, 3), irand(1, 3));
+    }
+    // breakers on the nearest shore, roughly once per passing swell
+    if (E.breaker <= 0) {
+      E.breaker = rand(5, 10) / (0.6 + 0.4 * Math.min(W, 2));
+      if (O.shoreD < 350 && W > 0.05 && !busy) {
+        const p = O.shoreP, a = rand(0, TAU), j = rand(5, 35);
+        this._breaker({ x: p.x + Math.cos(a) * j, y: 0.5, z: p.z + Math.sin(a) * j }, (0.25 + 0.35 * Math.min(W, 3)) * Math.exp(-O.shoreD / 260));
+      }
+    }
+    // gulls: a few out at sea, a chorus around the harbour
+    if (E.gull <= 0) {
+      const hb = Math.exp(-O.harbourD / 250);
+      E.gull = rand(2, 9) / (0.35 + 1.6 * hb + 0.4 * Math.exp(-O.shoreD / 150));
+      if (!busy) this._gull(this._skyPoint(25, 140, 8, 45));
+    }
+    // the bell buoy off the harbour mouth rings when the swell rocks it
+    if (E.bell <= 0) {
+      E.bell = rand(2.5, 7) / (0.5 + 0.5 * Math.min(W, 2));
+      const bell = this.layout && (this.layout.buoys || []).find(b => b.kind === 'bell');
+      if (bell && W > 0.05 && !busy && Math.hypot(bell.x - L.x, bell.z - L.z) < 2500) this._buoyBell({ x: bell.x, y: 2.5, z: bell.z }, irand(1, chance(0.3) ? 3 : 2));
+    }
+    // a foghorn from far away, now and then
+    if (E.foghorn <= 0) {
+      if (now - this.lastHi > 20) { this._foghorn(); this.lastHi = now; E.foghorn = rand(160, 360); } else E.foghorn = rand(10, 30);
+    }
+    // harbour: halyards clinking against masts, mooring lines creaking
+    if (E.clink <= 0) {
+      E.clink = rand(1.2, 5);
+      if (O.harbourD < 220 && !busy) this._clink(this._harbourPoint(), 0.05 * Math.exp(-O.harbourD / 120) + 0.02);
+    }
+    if (E.creak <= 0) {
+      E.creak = rand(3, 10);
+      if (O.harbourD < 160 && !busy) this._creak(this._harbourPoint(), 0.06);
+    }
+  }
+
+  _oHull() {
+    const L = this.L, a = Math.atan2(L.fz, L.fx) + rand(-2.2, 2.2), d = rand(2, 5);
+    const x = L.x + Math.cos(a) * d, z = L.z + Math.sin(a) * d;
+    const y = this.hasWorld ? ENV.surface(x, z) : L.y - 2.5;
+    return { x, y: isFinite(y) ? y : 0, z };
+  }
+
+  _harbourPoint() {
+    const lay = this.layout, d = lay && lay.docks && lay.docks[0];
+    const c = d ? { x: d.x + 6, z: d.z - 20 } : { x: this.L.x + 20, z: this.L.z };
+    return { x: c.x + rand(-15, 15), y: rand(2, 6), z: c.z + rand(-35, 45) };
+  }
+
+  // A wave breaking on the shore: rising roar, the crash, then a long fizzing wash up the beach.
+  _breaker(pos, power) {
+    const v = this._voice(pos, { power, hrtf: false, bus: this.bus.water, wet: 0.3, gain: 0 });
+    const t = this.ctx.currentTime + 0.03;
+    const lp = this._filter(v, 'lowpass', 300, 0.6); lp.connect(v.input);
+    this._noise(v, 'pink', t, lp);
+    const rise = rand(0.4, 0.9), crash = rand(0.15, 0.3), tail = rand(1.6, 3.2);
+    v.env.setValueAtTime(0, t);
+    v.env.linearRampToValueAtTime(0.35, t + rise);
+    v.env.linearRampToValueAtTime(1, t + rise + crash);
+    v.env.setTargetAtTime(0, t + rise + crash, tail / 3);
+    lp.frequency.setValueAtTime(260, t);
+    lp.frequency.exponentialRampToValueAtTime(900, t + rise);
+    lp.frequency.exponentialRampToValueAtTime(3200, t + rise + crash);
+    lp.frequency.setTargetAtTime(700, t + rise + crash, tail / 2);
+    const bp = this._filter(v, 'bandpass', rand(3500, 5500), 0.7), fg = this._gain(v, 0);
+    bp.connect(fg); fg.connect(v.input);
+    this._noise(v, 'white', t, bp);
+    fg.gain.setValueAtTime(0, t);
+    fg.gain.setTargetAtTime(0.35, t + rise + crash * 0.5, 0.15);
+    fg.gain.setTargetAtTime(0, t + rise + crash + 0.4, tail / 2.5);
+    this._retire(v, t + rise + crash + tail * 2.2);
+  }
+
+  // Herring gull: the long call (a drawn-out "keeew" then "kyow-kyow-kyow…"), or a few mews.
+  _gull(pos) {
+    const v = this._voice(pos, { power: rand(0.18, 0.3), bus: this.bus.birds, wet: 0.15 });
+    let t = this.ctx.currentTime + 0.03;
+    const form = this._filter(v, 'bandpass', rand(2100, 2700), 1.3); form.connect(v.input);
+    const f = this._osc(v, this.waves.voice, 900, t, form).frequency;
+    const nb = this._filter(v, 'bandpass', 3000, 1.0), ng = this._gain(v, 0.12);
+    nb.connect(ng); ng.connect(form); this._noise(v, 'white', t, nb);
+    const base = rand(0.88, 1.12), g = v.env;
+    if (chance(0.55)) {
+      const d0 = rand(0.35, 0.55);
+      f.setValueAtTime(1150 * base, t); f.linearRampToValueAtTime(1900 * base, t + d0 * 0.4); f.exponentialRampToValueAtTime(1050 * base, t + d0);
+      env(g, t, d0, 0.8, 0.03, 0.08, 0.8);
+      t += d0 + rand(0.08, 0.15);
+      const n = irand(3, 8);
+      for (let i = 0; i < n; i++) {
+        const d = rand(0.13, 0.19), kk = base * (1 - i * 0.025);
+        f.setValueAtTime(1350 * kk, t); f.linearRampToValueAtTime(2100 * kk, t + d * 0.35); f.exponentialRampToValueAtTime(1150 * kk, t + d);
+        env(g, t, d, rand(0.75, 1), 0.01, 0.04, 0.85);
+        t += d + rand(0.05, 0.1);
+      }
+    } else {
+      const n = irand(1, 3);
+      for (let i = 0; i < n; i++) {
+        const d = rand(0.22, 0.4);
+        f.setValueAtTime(1500 * base, t); f.exponentialRampToValueAtTime(1000 * base, t + d);
+        env(g, t, d, rand(0.6, 0.9), 0.02, 0.08, 0.8);
+        t += d + rand(0.25, 0.9);
+      }
+    }
+    this._retire(v, t + 0.1);
+  }
+
+  _buoyBell(pos, strikes = 1) {
+    const v = this._voice(pos, { power: 0.32, bus: this.bus.village, echo: 0.12, wet: 0.35, gain: 1 });
+    const f = rand(0.97, 1.03) * 560;
+    let t = this.ctx.currentTime + 0.03, end = t;
+    for (let i = 0; i < strikes; i++) {
+      end = Math.max(end, this._bellStrike(v, t, f, CAST, rand(0.5, 1), f * 4.2));
+      t += rand(0.35, 1.1);
+    }
+    this._retire(v, end);
+  }
+
+  // A distant diaphone foghorn: a long low blast ending in the characteristic downward "grunt".
+  _foghorn() {
+    const pos = this._skyPoint(3000, 5500, -10, 20);
+    const v = this._voice(pos, { power: 7, bus: this.bus.village, echo: 0.5, wet: 0.7 });
+    const t = this.ctx.currentTime + 0.05, F = rand(150, 175), dur = rand(2.4, 3.2);
+    const tone = this._filter(v, 'lowpass', 700, 0.8); tone.connect(v.input);
+    const f = this._osc(v, this.waves.horn, F, t, tone).frequency;
+    const g = v.env;
+    g.setValueAtTime(0, t); g.linearRampToValueAtTime(1, t + 0.35);
+    g.setValueAtTime(1, t + dur); g.linearRampToValueAtTime(0.85, t + dur + 0.1);
+    f.setValueAtTime(F, t + dur); f.exponentialRampToValueAtTime(F * 0.78, t + dur + 0.35);
+    g.setTargetAtTime(0, t + dur + 0.3, 0.12);
+    this._retire(v, t + dur + 1.2);
+  }
+
+  _clink(pos, power) {
+    const v = this._voice(pos, { power, bus: this.bus.village, wet: 0.2, gain: 1 });
+    let t = this.ctx.currentTime + 0.02;
+    const f0 = rand(1700, 2600), n = irand(1, 3);
+    for (let i = 0; i < n; i++) {
+      for (const [r, a, tau] of [[1, 1, 0.25], [2.76, 0.5, 0.12], [5.4, 0.25, 0.06]]) {
+        const gg = this._gain(v, 0); gg.connect(v.input);
+        this._ping(v, f0 * r, t, t + tau * 6, gg);
+        strike(gg.gain, t, a * rand(0.6, 1), tau, 0.001);
+      }
+      t += rand(0.12, 0.45);
+    }
+    this._retire(v, t + 1.5);
+  }
+
+  // A mooring line or fender creaking: stick-slip buzz through a woody resonance.
+  _creak(pos, power) {
+    const v = this._voice(pos, { power, bus: this.bus.village, wet: 0.15 });
+    const t = this.ctx.currentTime + 0.03, d = rand(0.4, 1.0);
+    const bp = this._filter(v, 'bandpass', rand(600, 1100), 3); bp.connect(v.input);
+    const o = this._osc(v, 'sawtooth', 90, t, bp);
+    o.frequency.setValueAtTime(rand(70, 120), t); o.frequency.linearRampToValueAtTime(rand(110, 180), t + d);
+    env(v.env, t, d, 0.5, 0.08, 0.15, 0.9);
+    this._retire(v, t + d + 0.1);
+  }
+
+
   // Fire any layer on demand (debug pages, scripted moments).
   trigger(kind) {
     const now = this.ctx.currentTime;
+    if (kind === 'gull') { this._gull(this._skyPoint(20, 60, 8, 25)); return; }
+    if (kind === 'breaker') { this._breaker(this.ocean ? this.ocean.shoreP : this._skyPoint(30, 80, -2, 0), 0.5); return; }
+    if (kind === 'buoyBell') { this._buoyBell(this._skyPoint(80, 200, 0, 2), 2); return; }
+    if (kind === 'foghorn') { this._foghorn(); return; }
+    if (kind === 'clink') { this._clink(this._skyPoint(5, 15, 1, 4), 0.06); return; }
+    if (kind === 'creak') { this._creak(this._skyPoint(4, 10, 0, 2), 0.06); return; }
     if (SONG[kind]) { this._sing(this._newBird(kind, this._forestPoint(18, 45)), now + 0.03); return; }
     switch (kind) {
       case 'cuckoo': this._cuckoo(now); break;

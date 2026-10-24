@@ -36,10 +36,32 @@ const GradeShader = {
     }`,
 };
 
+// Contrast-adaptive sharpening (after tone mapping): crisper grass, trees and far mountains
+// without ringing — strength adapts to local contrast.
+const SharpenShader = {
+  uniforms: { tDiffuse: { value: null }, uTexel: { value: new THREE.Vector2(1, 1) }, uAmount: { value: 0.55 } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform vec2 uTexel; uniform float uAmount; varying vec2 vUv;
+    void main(){
+      vec3 c = texture2D(tDiffuse, vUv).rgb;
+      vec3 n = texture2D(tDiffuse, vUv + vec2(0.0, uTexel.y)).rgb;
+      vec3 s = texture2D(tDiffuse, vUv - vec2(0.0, uTexel.y)).rgb;
+      vec3 e = texture2D(tDiffuse, vUv + vec2(uTexel.x, 0.0)).rgb;
+      vec3 w = texture2D(tDiffuse, vUv - vec2(uTexel.x, 0.0)).rgb;
+      vec3 mn = min(c, min(min(n, s), min(e, w)));
+      vec3 mx = max(c, max(max(n, s), max(e, w)));
+      // CAS weight: less sharpening where contrast is already high
+      vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));
+      vec3 wgt = -amp * mix(0.125, 0.2, uAmount);
+      vec3 res = (c + (n + s + e + w) * wgt) / (1.0 + 4.0 * wgt);
+      gl_FragColor = vec4(clamp(res, 0.0, 1.0), 1.0);
+    }`,
+};
+
 export function createRenderer(canvas) {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
-  const pr = Math.min(window.devicePixelRatio, 1.5);
-  renderer.setPixelRatio(pr);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 0.88;
@@ -55,14 +77,29 @@ export function createComposer(renderer, scene, camera) {
   const composer = new EffectComposer(renderer, rt);
   composer.addPass(new RenderPass(scene, camera));
   composer.addPass(new ShaderPass(SanitizeShader));
-  const bloom = new UnrealBloomPass(new THREE.Vector2(size.x / 2, size.y / 2), 0.22, 0.5, 0.92);
+  const bloom = new UnrealBloomPass(new THREE.Vector2(size.x / 2, size.y / 2), 0.16, 0.45, 0.95);
   composer.addPass(bloom);
   composer.addPass(new OutputPass());
+  const sharpen = new ShaderPass(SharpenShader);
+  composer.addPass(sharpen);
   const grade = new ShaderPass(GradeShader);
   composer.addPass(grade);
+  const texel = () => {
+    const d = renderer.getDrawingBufferSize(new THREE.Vector2());
+    sharpen.uniforms.uTexel.value.set(1 / d.x, 1 / d.y);
+  };
+  texel();
   return {
-    composer, bloom, grade,
-    setSize(w, h) { composer.setSize(w, h); },
+    composer, bloom, grade, sharpen,
+    setSize(w, h) { composer.setSize(w, h); texel(); },
+    // render resolution relative to the screen (quality setting)
+    setPixelRatio(pr) {
+      renderer.setPixelRatio(pr);
+      composer.setPixelRatio(pr);
+      composer.setSize(innerWidth, innerHeight);
+      texel();
+    },
+    setSharpen(on, amount = 0.55) { sharpen.enabled = on; sharpen.uniforms.uAmount.value = amount; },
     render(dt) { composer.render(dt); },
   };
 }

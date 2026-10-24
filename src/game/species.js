@@ -64,14 +64,84 @@ export const SPECIES = {
   },
 };
 
+// ---- Open Ocean (big game). Habitat keys: reef, open, deep, surface, dropoff, shallows.
+// depthM = absolute swimming depth (m); minDepth = won't come into shallower water; sense = lure-notice multiplier.
+const OCEAN = {
+  greatWhite: {
+    name: 'Great White Shark', local: 'Weisser Hai', latin: 'Carcharodon carcharias',
+    len: [2.5, 5.5], a: 8.4, power: 2.2, speed: 6, jumpy: 0.05, abundance: 0.15, value: 34, sense: 2.4,
+    depth: [0.2, 0.6], depthM: [1, 16], minDepth: 10, habitat: { open: 0.6, dropoff: 0.8, deep: 0.4, surface: 0.3 },
+    lures: { float: 1.0, minnow: 0.4, spoon: 0.2, spinner: 0.1 },
+  },
+  hammerhead: {
+    name: 'Great Hammerhead', local: 'Hammerhai', latin: 'Sphyrna mokarran',
+    len: [2.0, 5.0], a: 4.2, power: 2.0, speed: 5.5, jumpy: 0.02, abundance: 0.4, value: 26, sense: 2.4,
+    depth: [0.3, 0.7], depthM: [2, 18], minDepth: 6, habitat: { shallows: 0.5, reef: 0.5, dropoff: 0.6 },
+    lures: { float: 0.9, minnow: 0.4, spoon: 0.3, spinner: 0.2 },
+  },
+  mako: {
+    name: 'Shortfin Mako', local: 'Makohai', latin: 'Isurus oxyrinchus',
+    len: [1.8, 3.8], a: 10, power: 2.4, speed: 8, jumpy: 0.65, abundance: 0.35, value: 30, sense: 2.0,
+    depth: [0.2, 0.5], depthM: [1, 14], minDepth: 10, habitat: { open: 1, surface: 0.4, deep: 0.4 },
+    lures: { minnow: 0.9, float: 0.8, spoon: 0.6, spinner: 0.4 },
+  },
+  blueMarlin: {
+    name: 'Blue Marlin', local: 'Blauer Marlin', latin: 'Makaira nigricans',
+    len: [2.0, 4.3], a: 6.8, power: 2.6, speed: 8.5, jumpy: 0.95, abundance: 0.3, value: 38, sense: 1.9,
+    depth: [0.1, 0.4], depthM: [0.5, 9], minDepth: 15, habitat: { open: 1, surface: 0.6, deep: 0.5, dropoff: 0.4 },
+    lures: { minnow: 1.0, spoon: 0.5, float: 0.4, spinner: 0.2 },
+  },
+  swordfish: {
+    name: 'Swordfish', local: 'Schwertfisch', latin: 'Xiphias gladius',
+    len: [1.8, 4.0], a: 8.5, power: 2.4, speed: 7.5, jumpy: 0.3, abundance: 0.25, value: 32, sense: 1.6,
+    depth: [0.5, 0.9], depthM: [8, 28], minDepth: 25, habitat: { deep: 1, dropoff: 0.6 },
+    lures: { float: 1.0, spoon: 0.5, minnow: 0.4, spinner: 0.1 },
+  },
+  bluefinTuna: {
+    name: 'Atlantic Bluefin Tuna', local: 'Roter Thun', latin: 'Thunnus thynnus',
+    len: [1.2, 3.0], a: 21, power: 2.8, speed: 9, jumpy: 0.05, abundance: 0.4, value: 30, sense: 1.6,
+    depth: [0.2, 0.6], depthM: [2, 20], minDepth: 12, habitat: { open: 0.9, deep: 0.6, dropoff: 0.5 },
+    lures: { minnow: 0.9, spoon: 0.9, float: 0.5, spinner: 0.3 },
+  },
+  yellowfinTuna: {
+    name: 'Yellowfin Tuna', local: 'Gelbflossenthun', latin: 'Thunnus albacares',
+    len: [0.8, 2.2], a: 17, power: 2.5, speed: 8.5, jumpy: 0.05, abundance: 0.8, value: 20, sense: 1.5,
+    depth: [0.1, 0.5], depthM: [1, 14], minDepth: 8, habitat: { open: 1, surface: 0.7 },
+    lures: { spoon: 1.0, minnow: 0.9, spinner: 0.5, float: 0.5 },
+  },
+  mahiMahi: {
+    name: 'Mahi-mahi', local: 'Goldmakrele', latin: 'Coryphaena hippurus',
+    len: [0.6, 1.6], a: 6.8, power: 1.6, speed: 7, jumpy: 0.8, abundance: 1.0, value: 16, sense: 1.4,
+    depth: [0.05, 0.3], depthM: [0.3, 5], minDepth: 5, habitat: { surface: 1, open: 0.8 },
+    lures: { spinner: 0.9, minnow: 0.9, spoon: 0.8, float: 0.6 },
+  },
+  giantGrouper: {
+    name: 'Goliath Grouper', local: 'Riesenzackenbarsch', latin: 'Epinephelus itajara',
+    len: [1.0, 2.5], a: 30, power: 1.7, speed: 3.5, jumpy: 0, abundance: 0.6, value: 22, sense: 1.3,
+    depth: [0.8, 1.0], minDepth: 4, habitat: { reef: 1, dropoff: 0.5, shallows: 0.3 },
+    lures: { float: 1.0, spoon: 0.7, minnow: 0.5, spinner: 0.2 },
+  },
+  barracuda: {
+    name: 'Great Barracuda', local: 'Barrakuda', latin: 'Sphyraena barracuda',
+    len: [0.6, 1.8], a: 5.6, power: 1.4, speed: 7, jumpy: 0.2, abundance: 0.9, value: 12, sense: 1.4,
+    depth: [0.1, 0.5], depthM: [0.5, 6], minDepth: 2, habitat: { reef: 0.8, shallows: 0.8, surface: 0.4 },
+    lures: { spinner: 1.0, minnow: 0.9, spoon: 0.8, float: 0.3 },
+  },
+};
+Object.assign(SPECIES, OCEAN);
+export const RIVER_SPECIES = ['brownTrout', 'rainbowTrout', 'grayling', 'arcticChar', 'pike', 'perch', 'huchen', 'whitefish', 'barbel', 'chub'];
+export const OCEAN_SPECIES = Object.keys(OCEAN);
+
 export const SPECIES_IDS = Object.keys(SPECIES);
 
 export function weightOf(id, len) { return SPECIES[id].a * len * len * len; }
+// weight as it counts for points and price: river fish unchanged, ocean giants soft-capped
+export function tradeWeight(kg) { return kg <= 25 ? kg : 25 + 2.5 * Math.sqrt(kg - 25); }
 
 export function pointsFor(id, len) {
   const s = SPECIES[id];
   const t = (len - s.len[0]) / (s.len[1] - s.len[0]);
-  return Math.round(s.value * (1 + weightOf(id, len)) * (1 + t * t * 2));
+  return Math.round(s.value * (1 + tradeWeight(weightOf(id, len))) * (1 + t * t * 2));
 }
 
 // Biased random length: most fish are average, trophies are rare.

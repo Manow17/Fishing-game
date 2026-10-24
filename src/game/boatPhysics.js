@@ -1,8 +1,9 @@
-// 2.5D boat dynamics on a flowing river: thrust, hull drag vs. current, anchor, banks and rocks.
-import { flowAt, riverCoords, waterY, riverRocks, PLAY_Z, rapids } from '../world/river.js';
-import { sampleDepth } from '../world/terrain.js';
+// 2.5D boat dynamics: thrust, hull drag vs. current, anchor, shores and rocks — plus real buoyancy:
+// the hull samples the actual wave surface (ENV.surface) at bow, stern and both sides and rides it with
+// spring-damped heave, pitch and roll, so big waves lift, tilt and drop the boat.
+import { ENV } from '../world/env.js';
 
-const _f = {}, _c = {};
+const _f = {};
 
 export class BoatPhysics {
   constructor(x, z, heading = 0) {
@@ -10,15 +11,33 @@ export class BoatPhysics {
     this.vx = 0; this.vz = 0; this.w = 0;
     this.throttle = 0; this.steer = 0;
     this.anchored = false; this.anchorX = 0; this.anchorZ = 0; this.rope = 9;
-    this.mass = 480; this.inertia = 2600;
-    this.maxThrust = 2100;
-    this.halfLen = 3.6;
-    this.y = waterY(z); this.pitch = 0; this.roll = 0;
+    this.setHull({ mass: 480, thrust: 2100, halfLength: 3.6, beam: 1.64, draft: 0.2 }, 1);
+    this.y = ENV.waterLevel(x, z); this.vy = 0;
+    this.pitch = 0; this.roll = 0; this.vPitch = 0; this.vRoll = 0;
     this.speedOverGround = 0; this.flowSpeed = 0;
     this.bump = 0; // collision impulse for sound/shake
+    this.slam = 0; // wave impact (camera shake / spray)
     this.t = 0;
-    this.obstacles = riverRocks.slice(); // circles {x, z, r}: river boulders + dock pilings
+    this.obstacles = ENV.obstacles.slice(); // circles {x, z, r}: rocks + dock pilings
+    this.thrustMult = 1;
   }
+
+  // hull from the boat model's physics block, scaled by the size slider
+  setHull(p, size = 1) {
+    this.size = size;
+    this.halfLen = p.halfLength * size;
+    this.beam = p.beam * size;
+    this.mass = p.mass * size * size * size;
+    this.inertia = this.mass * (2 * this.halfLen) ** 2 / 10;
+    this.baseThrust = p.thrust * size * size;
+    // drag scales with wetted area
+    this.dragF = 38 * size * size;
+    this.dragS = 520 * size * size;
+    this.rotDrag = 2400 * size ** 4;
+    this.rotDrag2 = 5200 * size ** 4;
+  }
+  get maxThrust() { return this.baseThrust * this.thrustMult; }
+  set maxThrust(v) { this.thrustMult = v / Math.max(1, this.baseThrust); }
 
   setAnchor(on) {
     this.anchored = on;
@@ -34,50 +53,72 @@ export class BoatPhysics {
     const h = dt / sub;
     for (let i = 0; i < sub; i++) this._step(h);
     this.t += dt;
-    // vertical motion: ride the surface, waves give pitch/roll
-    const wy = waterY(this.z);
-    const rp = rapids(this.z);
-    const t = this.t;
-    const amp = 0.04 + rp * 0.18;
+    this._buoyancy(dt);
+  }
+
+  // Ride the waves: sample the surface around the hull and spring toward it.
+  _buoyancy(dt) {
     const fx = Math.sin(this.h), fz = Math.cos(this.h);
-    const wave = (x, z) => amp * (Math.sin(z * 0.9 + x * 0.3 - t * 2.1) + Math.sin(z * 0.37 - x * 0.55 + t * 1.3) * 0.8 + rp * Math.sin(z * 1.6 + Math.sin(x * 0.7) * 1.5) * 1.5);
-    const bow = wave(this.x + fx * 3, this.z + fz * 3), stern = wave(this.x - fx * 3, this.z - fz * 3);
-    const port = wave(this.x - fz * 0.8, this.z + fx * 0.8), stbd = wave(this.x + fz * 0.8, this.z - fx * 0.8);
+    const L = this.halfLen * 0.8, B = this.beam * 0.45;
+    const S = (dx, dz) => ENV.surface(this.x + dx, this.z + dz);
+    const bow = S(fx * L, fz * L), stern = S(-fx * L, -fz * L);
+    const port = S(-fz * B, fx * B), stbd = S(fz * B, -fx * B);
+    const mid = S(0, 0);
+    flowAt(this);
     const fwdSpeed = (this.vx - _f.x) * fx + (this.vz - _f.z) * fz;
-    const squat = Math.max(0, Math.min(1, fwdSpeed / 7)) * this.throttle;
-    const targetPitch = Math.atan2(stern - bow, 6) - squat * 0.07;
-    const targetRoll = Math.atan2(stbd - port, 1.6) * 0.6 - this.w * 0.12 * Math.min(1, Math.abs(fwdSpeed) / 3);
-    const k = Math.min(1, dt * 4);
-    this.pitch += (targetPitch - this.pitch) * k;
-    this.roll += (targetRoll - this.roll) * k;
-    this.y += ((wy + (bow + stern + port + stbd) * 0.25 + squat * 0.05) - this.y) * Math.min(1, dt * 6);
+    const squat = Math.max(0, Math.min(1, fwdSpeed / 7)) * Math.max(0, this.throttle);
+    // heave: stiff spring to the mean surface, damped; a light hull pops back up quicker
+    const targetY = (bow + stern + port + stbd + mid * 2) / 6 + squat * 0.06;
+    const k = 38, c = 9;
+    const ay = k * (targetY - this.y) - c * this.vy;
+    this.vy += ay * dt;
+    this.y += this.vy * dt;
+    // pitch / roll from the surface slope, with inertia so the boat rocks and overshoots a little
+    const tPitch = Math.atan2(stern - bow, 2 * L) - squat * 0.08;
+    const tRoll = Math.atan2(stbd - port, 2 * B) * 0.75 - this.w * 0.12 * Math.min(1, Math.abs(fwdSpeed) / 3);
+    const kp = 26, cp = 6.5;
+    this.vPitch += (kp * (tPitch - this.pitch) - cp * this.vPitch) * dt;
+    this.vRoll += (kp * 0.8 * (tRoll - this.roll) - cp * 0.8 * this.vRoll) * dt;
+    this.pitch += this.vPitch * dt;
+    this.roll += this.vRoll * dt;
+    this.pitch = Math.max(-0.6, Math.min(0.6, this.pitch));
+    this.roll = Math.max(-0.5, Math.min(0.5, this.roll));
+    // slamming into a wave face at speed
+    const face = Math.max(0, (bow - stern) / (2 * L)) * Math.max(0, fwdSpeed);
+    this.slam = Math.max(this.slam * Math.exp(-dt * 4), face > 0.6 ? face * 0.5 : 0);
+    // big waves shove the boat down their slopes (surface gradient in world space)
+    if (ENV.waveScale > 1.05 && !this.moored) {
+      const gx = (S(1.5, 0) - S(-1.5, 0)) / 3, gz = (S(0, 1.5) - S(0, -1.5)) / 3;
+      const push = 4.5 * dt;
+      this.vx -= gx * push;
+      this.vz -= gz * push;
+    }
   }
 
   _step(dt) {
-    if (this.moored) { this.vx = this.vy = 0; this.vz = 0; this.w = 0; this.speedOverGround = 0; return; }
-    flowAt(this.x, this.z, _f);
+    if (this.moored) { this.vx = this.vz = 0; this.w = 0; this.speedOverGround = 0; return; }
+    flowAt(this);
     this.flowSpeed = _f.speed;
     const fx = Math.sin(this.h), fz = Math.cos(this.h);
-    const rx = fz, rz = -fx; // starboard
+    const rx = fz, rz = -fx;
     const rvx = this.vx - _f.x, rvz = this.vz - _f.z;
     const vf = rvx * fx + rvz * fz;
     const vs = rvx * rx + rvz * rz;
     let Fx = 0, Fz = 0, tq = 0;
-    // outboard thrust at the stern, angled by steering
+    // thrust at the stern, angled by steering
     const steerAng = this.steer * 0.55; // +steer = starboard turn (pushes stern to port)
     const thrust = this.throttle * this.maxThrust * (this.throttle < 0 ? 0.45 : 1);
     const tdx = Math.sin(this.h + steerAng), tdz = Math.cos(this.h + steerAng);
     Fx += tdx * thrust; Fz += tdz * thrust;
     const lat = thrust * Math.sin(steerAng);
-    tq += -lat * this.halfLen; // stern lever: pushes stern sideways
+    tq += -lat * this.halfLen;
     // rudder/skeg effect even when coasting
-    tq += -vf * this.steer * 220 * (Math.abs(this.throttle) < 0.05 ? 1 : 0.3);
-    // hull drag (long narrow hull: low forward, high lateral)
-    const Df = 38 * vf * Math.abs(vf) + 60 * vf;
-    const Ds = 520 * vs * Math.abs(vs) + 300 * vs;
+    tq += -vf * this.steer * 220 * this.size ** 3 * (Math.abs(this.throttle) < 0.05 ? 1 : 0.3);
+    // hull drag (low forward, high lateral)
+    const Df = this.dragF * vf * Math.abs(vf) + 60 * this.size * vf;
+    const Ds = this.dragS * vs * Math.abs(vs) + 300 * this.size * vs;
     Fx -= fx * Df + rx * Ds; Fz -= fz * Df + rz * Ds;
-    // rotational damping (hull sweeping through water)
-    tq -= 2400 * this.w + 5200 * this.w * Math.abs(this.w);
+    tq -= this.rotDrag * this.w + this.rotDrag2 * this.w * Math.abs(this.w);
     // anchor rope at the bow
     if (this.anchored) {
       const bx = this.x + fx * this.halfLen, bz = this.z + fz * this.halfLen;
@@ -87,9 +128,8 @@ export class BoatPhysics {
         const pvx = this.vx + this.w * fz * this.halfLen, pvz = this.vz - this.w * fx * this.halfLen;
         const ux = dx / d, uz = dz / d;
         const vRel = pvx * ux + pvz * uz;
-        const F = Math.max(0, 2600 * (d - this.rope) - 900 * vRel);
+        const F = Math.max(0, (2600 * (d - this.rope) - 900 * vRel) * this.mass / 480);
         Fx += ux * F; Fz += uz * F;
-        // torque = r x F (2D cross, y-up, heading-based frame)
         const rbx = fx * this.halfLen, rbz = fz * this.halfLen;
         tq += (rbz * ux * F - rbx * uz * F);
       }
@@ -100,50 +140,54 @@ export class BoatPhysics {
     this.x += this.vx * dt;
     this.z += this.vz * dt;
     this.h += this.w * dt;
-    this._collide(dt);
+    this._collide();
     this.speedOverGround = Math.hypot(this.vx, this.vz);
   }
 
   _collide() {
     const fx = Math.sin(this.h), fz = Math.cos(this.h);
-    // sample bow, middle and stern against banks/shallows
+    const minDepth = 0.35 + 0.1 * this.size;
+    // bow, middle and stern against shores and shallows: push toward deeper water
     for (const s of [-this.halfLen + 0.5, 0, this.halfLen - 0.5]) {
       const px = this.x + fx * s, pz = this.z + fz * s;
-      const dep = sampleDepth(px, pz);
-      if (dep < 0.45) {
-        // push toward deeper water (works for banks, lake shores, islands and side rivers)
-        let nx = sampleDepth(px + 1.5, pz) - sampleDepth(px - 1.5, pz);
-        let nz = sampleDepth(px, pz + 1.5) - sampleDepth(px, pz - 1.5);
+      const dep = ENV.depth(px, pz);
+      if (dep < minDepth) {
+        let nx = ENV.depth(px + 1.5, pz) - ENV.depth(px - 1.5, pz);
+        let nz = ENV.depth(px, pz + 1.5) - ENV.depth(px, pz - 1.5);
         const gl = Math.hypot(nx, nz);
-        if (gl < 1e-4) { riverCoords(px, pz, _c); nx = -Math.sign(_c.d) * _c.tz; nz = Math.sign(_c.d) * _c.tx; }
-        else { nx /= gl; nz /= gl; }
-        const pen = (0.45 - dep) * 2.5 + 0.05;
+        if (gl < 1e-4) { nx = -fx; nz = -fz; } else { nx /= gl; nz /= gl; }
+        const pen = (minDepth - dep) * 2.5 + 0.05;
         this.x += nx * pen * 0.5; this.z += nz * pen * 0.5;
         const vn = this.vx * nx + this.vz * nz;
         if (vn < 0) { this.vx -= nx * vn * 1.4; this.vz -= nz * vn * 1.4; this.bump = Math.max(this.bump, -vn); }
         this.w *= 0.96;
       }
     }
+    const reach = this.halfLen + 6;
     for (const r of this.obstacles) {
-      if (Math.abs(r.z - this.z) > 10) continue;
+      if (Math.abs(r.z - this.z) > reach + r.r || Math.abs(r.x - this.x) > reach + r.r) continue;
       for (const s of [-this.halfLen + 0.6, 0, this.halfLen - 0.6]) {
         const px = this.x + fx * s, pz = this.z + fz * s;
         const dx = px - r.x, dz = pz - r.z;
         const d = Math.hypot(dx, dz);
-        const R = r.r + 0.85;
+        const R = r.r + this.beam * 0.52;
         if (d < R && d > 1e-4) {
           const nx = dx / d, nz = dz / d;
           this.x += nx * (R - d); this.z += nz * (R - d);
           const vn = this.vx * nx + this.vz * nz;
           if (vn < 0) { this.vx -= nx * vn * 1.5; this.vz -= nz * vn * 1.5; this.bump = Math.max(this.bump, -vn); }
-          // spin off the rock
           this.w += (s / this.halfLen) * (nx * fz - nz * fx) * 0.02;
         }
       }
     }
-    if (this.z < PLAY_Z[0]) { this.vz = Math.max(this.vz, 0) + (PLAY_Z[0] - this.z) * 0.05; }
-    if (this.z > PLAY_Z[1]) { this.vz = Math.min(this.vz, 0) - (this.z - PLAY_Z[1]) * 0.05; }
+    const B = ENV.bounds;
+    if (this.z < B.z0) this.vz = Math.max(this.vz, 0) + (B.z0 - this.z) * 0.05;
+    if (this.z > B.z1) this.vz = Math.min(this.vz, 0) - (this.z - B.z1) * 0.05;
+    if (this.x < B.x0) this.vx = Math.max(this.vx, 0) + (B.x0 - this.x) * 0.05;
+    if (this.x > B.x1) this.vx = Math.min(this.vx, 0) - (this.x - B.x1) * 0.05;
   }
 
   serialize() { return [this.x, this.y, this.z, this.h, this.pitch, this.roll]; }
 }
+
+function flowAt(b) { return ENV.flowAt(b.x, b.z, _f); }

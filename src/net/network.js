@@ -30,12 +30,14 @@ export class Network {
 
   get active() { return !!this.peer; }
 
-  async host(info) {
+  // wantCode: re-open a specific lobby (after the owner switched maps); retried while the old id frees up
+  async host(info, wantCode = null) {
     const Peer = await loadPeerJS();
-    this.info = info;
+    this.info = { ...info, isHost: true };
     this.isHost = true;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const code = makeCode();
+    const tries = wantCode ? 12 : 4;
+    for (let attempt = 0; attempt < tries; attempt++) {
+      const code = wantCode || makeCode();
       try {
         await new Promise((res, rej) => {
           const peer = new Peer(PREFIX + code, { debug: 1 });
@@ -45,16 +47,30 @@ export class Network {
         });
         break;
       } catch (e) {
-        if (attempt === 3 || (e.type && e.type !== 'unavailable-id')) throw e;
+        if (attempt === tries - 1 || (e.type && e.type !== 'unavailable-id')) throw e;
+        if (wantCode) await new Promise(r => setTimeout(r, 1500));
       }
     }
-    this.roster.set(this.myId, info);
+    this.roster.set(this.myId, this.info);
     this.peer.on('connection', (conn) => this._accept(conn));
     this.peer.on('disconnected', () => { try { this.peer.reconnect(); } catch (_) {} });
     return this.code;
   }
 
-  async join(code, info) {
+  // retries: keep trying while the host is reloading (e.g. the lobby owner just switched maps)
+  async join(code, info, retries = 0) {
+    for (let attempt = 0; ; attempt++) {
+      try { return await this._joinOnce(code, info); }
+      catch (e) {
+        this.peer?.destroy(); this.peer = null;
+        if (attempt >= retries) throw e;
+        this.h.onStatus?.('Waiting for the lobby…');
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+  }
+
+  async _joinOnce(code, info) {
     const Peer = await loadPeerJS();
     this.info = info;
     this.isHost = false;
@@ -113,6 +129,7 @@ export class Network {
     if (!msg || typeof msg !== 'object') return;
     if (this.isHost) {
       // relay guests' messages to everyone else, stamped with sender
+      if (msg.t === 'e' && msg.d?.type === 'info' && this.roster.has(from)) this.roster.set(from, msg.d.info);
       if (msg.t === 's' || msg.t === 'e') {
         this._broadcast({ ...msg, from }, from);
         if (msg.t === 's') this.h.onState?.(from, msg.d);
@@ -139,6 +156,14 @@ export class Network {
   }
 
   sendState(d) { if (this.peer) this._broadcast({ t: 's', d }); }
+
+  // my profile changed (name, look…): everyone, including later joiners, gets the new one
+  updateInfo(info) {
+    this.info = { ...info, isHost: this.isHost };
+    if (!this.peer) return;
+    if (this.isHost) { this.roster.set(this.myId, this.info); this._broadcast({ t: 'join', id: this.myId, info: this.info }); }
+    else this._broadcast({ t: 'e', d: { type: 'info', info: this.info } });
+  }
   sendEvent(d) { if (this.peer) this._broadcast({ t: 'e', d }); }
 
   leave() {

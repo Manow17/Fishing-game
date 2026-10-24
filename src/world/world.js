@@ -1,11 +1,12 @@
 // Builds the whole environment step by step (with progress callbacks).
 import * as THREE from 'three';
-import { createTerrain, bakeHeightTexture, heightAt } from './terrain.js';
+import { createTerrain, bakeHeightTexture, heightAt, sampleHeight, sampleDepth, NEAR } from './terrain.js';
 import { createWater } from './water.js';
 import { createSky } from './sky.js';
 import { createForest, createRocks, createGrass } from './vegetation.js';
-import { computeLayout } from './layout.js';
-import { flowAt } from './river.js';
+import { computeLayout, SPAWN_Z, VILLAGE_SIDE, bankX } from './layout.js';
+import { flowAt, waterY, riverWave, riverCoords, rapids, habitat, riverRocks, PLAY_Z } from './river.js';
+import { setEnv, ENV, onWaveScale } from './env.js';
 import { createAmbientLife } from './life.js';
 import { createWaterfall } from './waterfall.js';
 
@@ -54,10 +55,49 @@ export async function buildWorld(scene, renderer, progress = () => {}) {
   world.life = createAmbientLife(scene, time);
   world.waterfall = createWaterfall(scene, terrain.shared.noise, time);
 
+  // things a walker bumps into on land, and the minimap's home marker
+  layout.colliders = [
+    ...layout.chalets.map(c => ({ x: c.x, z: c.z, r: 6.2 })),
+    ...layout.barns.map(b => ({ x: b.x, z: b.z, r: 4.2 })),
+    ...(layout.church ? [{ x: layout.church.x, z: layout.church.z, r: 8.5 }] : []),
+    ...layout.cows.map(c => ({ x: c.x, z: c.z, r: 1.2 })),
+  ];
+  layout.homeMark = { x: bankX(SPAWN_Z, VILLAGE_SIDE, 70), z: SPAWN_Z, label: '⌂' };
+
+  // ---- install the river map's environment
+  const rc = {};
+  setEnv({
+    id: 'river',
+    name: 'Aare Valley',
+    waterLevel: (x, z) => waterY(z),
+    waveHeight(x, z, t) {
+      riverCoords(x, z, rc);
+      return riverWave(x, z, t, ENV.waveScale, rapids(z), rc.n, sampleDepth(x, z));
+    },
+    flowAt,
+    groundY: sampleHeight,
+    depth: sampleDepth,
+    habitat(x, z, depth) {
+      const h = habitat(x, z, depth);
+      flowAt(x, z, _f);
+      h.slack = Math.max(0, 1 - _f.speed / 1.4);
+      return h;
+    },
+    rapids: (x, z) => rapids(z),
+    bounds: { x0: NEAR.x0 + 40, x1: NEAR.x1 - 40, z0: PLAY_Z[0], z1: PLAY_Z[1] },
+    obstacles: riverRocks.slice(),
+    spawn: { x: bankX(SPAWN_Z, VILLAGE_SIDE, 1.5) - VILLAGE_SIDE * 16, z: SPAWN_Z, h: Math.PI },
+    species: ['brownTrout', 'rainbowTrout', 'grayling', 'arcticChar', 'pike', 'perch', 'huchen', 'whitefish', 'barbel', 'chub'],
+    tackle: { lineBreakKg: 7.2, dragMaxKg: 5.9 },
+    drawMap: null,
+  });
+  onWaveScale((v) => water.setWaveScale(v));
+
   progress(0.92, 'Catching reflections…'); await frame();
 
   world.update = (dt, camera, focus) => {
     time.value += dt;
+    ENV.time = time.value;
     world.forest.refresh(camera.position);
     world.grass.update(focus || camera.position);
     sky.follow(focus || camera.position);

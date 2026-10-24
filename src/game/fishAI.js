@@ -2,13 +2,23 @@
 // noticing lures, following, striking — and rendering every fish (incl. the hooked one).
 import * as THREE from 'three';
 import { createFish } from '../models/fish.js';
-import { SPECIES, SPECIES_IDS, weightOf, rollLength } from './species.js';
-import { waterY, flowAt, habitat, PLAY_Z } from '../world/river.js';
-import { sampleHeight as heightAt, sampleDepth as depthAt } from '../world/terrain.js';
+import { SPECIES, weightOf, rollLength } from './species.js';
+import { ENV } from '../world/env.js';
+
+const waterY = (x, z) => ENV.waterLevel(x, z);
+const heightAt = (x, z) => ENV.groundY(x, z);
+const depthAt = (x, z) => ENV.depth(x, z);
+const flowAt = (x, z, out) => ENV.flowAt(x, z, out);
+
+// how deep a species swims here: absolute metres (ocean species) or a fraction of the local depth
+function swimDepth(sp, dep, rnd) {
+  if (sp.depthM) return Math.min(dep - 0.4, sp.depthM[0] + rnd() * (sp.depthM[1] - sp.depthM[0]));
+  return THREE.MathUtils.clamp(dep * (sp.depth[0] + rnd() * (sp.depth[1] - sp.depth[0])), 0.3, dep - 0.2);
+}
 
 const _f = {};
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3();
-const TARGET = 42, RADIUS = 110, DESPAWN = 150;
+const TARGET = 48, RADIUS = 110, DESPAWN = 150;
 
 function lureQuality(type, speed) {
   const band = (lo, hi) => speed < lo ? speed / lo : speed > hi ? Math.max(0.15, 1 - (speed - hi) * 0.8) : 1;
@@ -33,22 +43,22 @@ export class FishManager {
   }
 
   _pickSpecies(x, z) {
-    const h = habitat(x, z, depthAt(x, z));
-    flowAt(x, z, _f);
-    const slack = Math.max(0, 1 - _f.speed / 1.4);
-    const vals = { rock: h.rock, seam: h.seam, pool: h.pool, rapids: h.rapids, slack };
+    const dep = depthAt(x, z);
+    const vals = ENV.habitat(x, z, dep);
+    const ids = ENV.species.filter(id => SPECIES[id]);
     let total = 0;
-    const w = SPECIES_IDS.map(id => {
+    const w = ids.map(id => {
       const s = SPECIES[id];
       let sc = 0.12;
-      for (const k in s.habitat) sc += s.habitat[k] * vals[k];
+      for (const k in s.habitat) sc += s.habitat[k] * (vals[k] || 0);
+      if (s.minDepth && dep < s.minDepth) sc *= 0.05; // giants stay in deep enough water
       sc = sc * s.abundance;
       total += sc;
       return sc;
     });
     let r = this.rnd() * total;
-    for (let i = 0; i < w.length; i++) { r -= w[i]; if (r <= 0) return SPECIES_IDS[i]; }
-    return 'chub';
+    for (let i = 0; i < w.length; i++) { r -= w[i]; if (r <= 0) return ids[i]; }
+    return ids[0];
   }
 
   _spawn(center, near = false) {
@@ -56,7 +66,7 @@ export class FishManager {
       // biased toward the player so there is always something to fish for
       const r = Math.pow(this.rnd(), 1.3) * RADIUS, a = this.rnd() * Math.PI * 2;
       const x = center.x + Math.cos(a) * r;
-      const z = THREE.MathUtils.clamp(center.z + Math.sin(a) * r, PLAY_Z[0] + 20, PLAY_Z[1] - 20);
+      const z = THREE.MathUtils.clamp(center.z + Math.sin(a) * r, ENV.bounds.z0 + 20, ENV.bounds.z1 - 20);
       const dep = depthAt(x, z);
       if (dep < 0.5) continue;
       const dx = x - center.x, dz = z - center.z;
@@ -64,8 +74,7 @@ export class FishManager {
       const id = this._pickSpecies(x, z);
       const sp = SPECIES[id];
       const len = rollLength(id, this.rnd);
-      const surf = waterY(z);
-      const y = surf - THREE.MathUtils.clamp(dep * (sp.depth[0] + this.rnd() * (sp.depth[1] - sp.depth[0])), 0.3, dep - 0.2);
+      const y = waterY(x, z) - swimDepth(sp, dep, this.rnd);
       const seed = ((this.rnd() * 300) | 0) * 3 + (this.rnd() < 0.5 ? 0 : 1); // only the 2 preloaded colour variants
       const model = createFish(id, len, seed);
       model.object.visible = true;
@@ -124,7 +133,7 @@ export class FishManager {
     f.state = 'released';
     f.timer = 4;
     f.cooldown = 999;
-    f.pos.y = Math.min(f.pos.y, waterY(f.pos.z) - 0.3);
+    f.pos.y = Math.min(f.pos.y, waterY(f.pos.x, f.pos.z) - 0.3);
     if (!f.model.object.parent) this.scene.add(f.model.object);
   }
 
@@ -161,10 +170,10 @@ export class FishManager {
       if (lure.active && f.cooldown <= 0) {
         const d = f.pos.distanceTo(lure.pos);
         const aff = sp.lures[lure.type] ?? 0.3;
-        const R = 9 * lure.vis * (0.6 + aff * 0.6);
+        const R = 11.5 * lure.vis * (0.6 + aff * 0.6) * (sp.sense || 1);
         if (d < R) {
           const q = lureQuality(lure.type, lure.speed);
-          const p = aff * (0.25 + q * 0.75) * f.aggr * 1.4 * dt * (lure.type === 'float' ? 0.9 : 1);
+          const p = aff * (0.25 + q * 0.75) * f.aggr * 2.3 * dt * (lure.type === 'float' ? 0.9 : 1);
           if (this.rnd() < p) { f.state = 'interested'; f.timer = 3 + this.rnd() * 4; }
         }
       }
@@ -176,7 +185,7 @@ export class FishManager {
         const x = f.home.x + (this.rnd() - 0.5) * 16;
         const dep = depthAt(x, z);
         if (dep > 0.5) {
-          const y = waterY(z) - THREE.MathUtils.clamp(dep * (sp.depth[0] + this.rnd() * (sp.depth[1] - sp.depth[0])), 0.3, dep - 0.2);
+          const y = waterY(x, z) - swimDepth(sp, dep, this.rnd);
           f.home.set(x, y, z);
         }
       } else if (f.state === 'cruise' && f.timer <= 0) {
@@ -188,10 +197,10 @@ export class FishManager {
       if (d < 0.45 + f.len * 0.3) {
         const aff = sp.lures[lure.type] ?? 0.3;
         const q = lureQuality(lure.type, lure.speed);
-        const chance = aff * q * (0.4 + 0.5 * f.aggr);
+        const chance = Math.min(0.95, aff * q * (0.4 + 0.5 * f.aggr) * 1.35);
         f.decide = (f.decide || 0) - dt;
         if (f.decide <= 0) {
-          f.decide = 0.6 + this.rnd() * 0.6;
+          f.decide = 0.4 + this.rnd() * 0.4;
           if (this.rnd() < chance) {
             if (this.rig && this.rig.onBite(f)) { f.state = 'biting'; f.timer = 2.2; }
           } else if (this.rnd() < 0.35) {
@@ -247,7 +256,7 @@ export class FishManager {
     f.vel.lerp(desired, Math.min(1, dt * 2.5));
     f.pos.addScaledVector(f.vel, dt);
     // stay in the water column
-    const surf = waterY(f.pos.z);
+    const surf = waterY(f.pos.x, f.pos.z);
     const bed = heightAt(f.pos.x, f.pos.z);
     if (bed > surf - 0.35) {
       // too shallow — push back

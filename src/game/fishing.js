@@ -2,8 +2,12 @@
 import * as THREE from 'three';
 import { createRod } from '../models/rod.js';
 import { createLure, LURE_TYPES } from '../models/lures.js';
-import { waterY, flowAt, depthAt, riverRocks, habitat } from '../world/river.js';
-import { sampleHeight as heightAt } from '../world/terrain.js'; // fast grid lookup in hot loops
+import { ENV } from '../world/env.js';
+
+// everything about the water comes from the active map (river, ocean, …)
+const surfAt = (x, z) => ENV.surface(x, z);          // includes waves
+const heightAt = (x, z) => ENV.groundY(x, z);
+const flowAt = (x, z, out) => ENV.flowAt(x, z, out);
 import { SPECIES } from './species.js';
 
 const G = 9.81;
@@ -18,9 +22,11 @@ const LURE_PHYS = {
   float: { sink: 0, lift: 0, vis: 0.75, mass: 0.015 },
 };
 
-export const DRAG_KG = (d) => 0.35 + (d - 1) * 0.62; // drag setting 1..10 -> kg
+// drag setting 1..10 -> kg, scaled to the map's tackle (light river spinning gear vs. big-game ocean gear)
+export const DRAG_KG = (d) => (0.06 + (d - 1) / 9 * 0.94) * ENV.tackle.dragMaxKg;
 export const LINE_BREAK_KG = 7.2;
-const MAX_LINE = 180;
+const MAX_LINE_DEFAULT = 180;
+const maxLine = () => ENV.tackle.spoolM ?? MAX_LINE_DEFAULT;
 
 // Rod placement shared by local + remote players.
 // Returns the rod object's world position/quaternion for a hand position and aim.
@@ -70,7 +76,7 @@ class Rope {
       const p = this.p[i], o = this.o[i];
       const vx = (p.x - o.x), vy = (p.y - o.y), vz = (p.z - o.z);
       o.copy(p);
-      const surf = waterY(p.z);
+      const surf = surfAt(p.x, p.z);
       if (p.y < surf) {
         flowAt(p.x, p.z, _f);
         // water drag pulls line toward the current, slight sink
@@ -139,7 +145,7 @@ export class FishingRig {
     this.pathPts = [];
 
     this.state = 'idle';
-    this.lineBreakKg = LINE_BREAK_KG; // braided line upgrade raises this
+    this.lineBreakKg = ENV.tackle.lineBreakKg; // braided line upgrade raises this
     this.lurePos = new THREE.Vector3();
     this.lureVel = new THREE.Vector3();
     this.baitPos = new THREE.Vector3();
@@ -300,7 +306,7 @@ export class FishingRig {
     const bendTarget = this.fish ? this.fish.mouthPos : (this.state === 'idle' || this.state === 'charging' ? _v.copy(tip).add(new THREE.Vector3(0, -1, 0)) : this.lurePos);
     this.rod.setBend(Math.max(0, this.bendAmount), bendTarget);
     this.rod.setReel({ crank: this.slip > 0.05 ? -this.slip * 1.2 : this.crank, bailOpen: this.bail, drag: (this.drag - 1) / 9 });
-    this.rod.setSpoolLine(1 - Math.min(1, this.lineOut / MAX_LINE) * 0.6);
+    this.rod.setSpoolLine(1 - Math.min(1, this.lineOut / maxLine()) * 0.6);
     this.rod.update(dt);
     this.rod.tip.getWorldPosition(this.tipPos);
 
@@ -371,7 +377,7 @@ export class FishingRig {
     v.y -= G * dt;
     this.lurePos.addScaledVector(v, dt);
     const d = this.lurePos.distanceTo(tip);
-    if (!this.feathered) this.lineOut = Math.min(MAX_LINE, Math.max(this.lineOut, d));
+    if (!this.feathered) this.lineOut = Math.min(maxLine(), Math.max(this.lineOut, d));
     else if (d > this.lineOut) {
       this.lurePos.sub(tip).multiplyScalar(this.lineOut / d).add(tip);
       // remove the outward velocity component (taut line)
@@ -381,7 +387,7 @@ export class FishingRig {
     }
     this.audio?.lineOut(this.feathered ? 0 : sp);
     const x = this.lurePos.x, z = this.lurePos.z;
-    const surf = waterY(z);
+    const surf = surfAt(x, z);
     const ground = heightAt(x, z);
     if (this.lurePos.y <= Math.max(surf, ground)) {
       if (ground < surf - 0.05) {
@@ -415,7 +421,7 @@ export class FishingRig {
     this.lureSince += dt;
     if (!this.snagged) this.lineOut = Math.max(0.3, this.lineOut - retrieve * dt);
     const old = _v3.copy(p);
-    const surf = waterY(p.z);
+    const surf = surfAt(p.x, p.z);
     const bed = heightAt(p.x, p.z);
     if (this.state === 'land') {
       // drag across the ground toward the tip
@@ -465,14 +471,15 @@ export class FishingRig {
       p.copy(target);
     }
     // keep inside water column
-    const surfNow = waterY(p.z);
+    const surfNow = surfAt(p.x, p.z);
     const bedNow = heightAt(p.x, p.z);
     if (this.lureType !== 'float') {
       if (p.y > surfNow - 0.04) { p.y = surfNow - 0.04; v.y = Math.min(v.y, 0); }
       if (p.y < bedNow + 0.06) {
         p.y = bedNow + 0.06; v.y = Math.max(0, v.y);
         // bottom contact while moving can snag
-        const rocky = habitat(p.x, p.z).rock;
+        const hb = ENV.habitat(p.x, p.z, ENV.depth(p.x, p.z));
+        const rocky = hb.rock ?? hb.reef ?? 0;
         if (!this.snagged && this.lureSince > 2 && this.lineOut > 4 && this.speedThroughWater > 0.15 && Math.random() < dt * (0.04 + rocky * 0.2)) {
           this.snagged = true;
           this.snagPull = 0;
@@ -619,15 +626,17 @@ export class FishingRig {
     const fish = this.fish;
     const s = SPECIES[fish.species];
     const m = fish.weight + 0.3;
+    // giants (sharks, billfish, big tuna) out-pull the drag, sulk instead of resting and tire slowly
+    const heft = Math.max(1, Math.sqrt(fish.weight / 40));
     this.fightT += dt;
     fish.phaseT -= dt;
     if (fish.phaseT <= 0 && !fish.jumping) {
       if (fish.phase === 'run') { fish.phase = 'rest'; fish.phaseT = 0.8 + Math.random() * 2.2 * (1.2 - fish.stamina); }
-      else { fish.phase = 'run'; fish.phaseT = (1.5 + Math.random() * 3.5) * (0.4 + fish.stamina * 0.8); this._pickRun(fish); }
+      else { fish.phase = 'run'; fish.phaseT = (1.5 + Math.random() * 3.5) * (0.4 + fish.stamina * 0.8) * Math.sqrt(heft); this._pickRun(fish); }
     }
-    const surf = waterY(fish.pos.z);
+    const surf = surfAt(fish.pos.x, fish.pos.z);
     const bed = heightAt(fish.pos.x, fish.pos.z);
-    const Fmax = G * 1.6 * Math.pow(fish.weight, 0.75) * Math.sqrt(s.power) * (0.25 + 0.75 * fish.stamina) + 2;
+    const Fmax = Math.min(G * 1.6 * Math.pow(fish.weight, 0.75) * Math.sqrt(s.power), dragN * (1.25 + 0.15 * (heft - 1)) + 8) * (0.25 + 0.75 * fish.stamina) + 2;
     const sub = 4, h = dt / sub;
     let T = 0;
     for (let i = 0; i < sub; i++) {
@@ -636,7 +645,7 @@ export class FishingRig {
       if (fish.jumping) {
         fish.fvel.y -= G * h;
         fish.pos.addScaledVector(fish.fvel, h);
-        if (fish.pos.y < waterY(fish.pos.z) - 0.1 && fish.fvel.y < 0) {
+        if (fish.pos.y < surfAt(fish.pos.x, fish.pos.z) - 0.1 && fish.fvel.y < 0) {
           fish.jumping = false;
           this.hooks.spawnSplash?.(fish.pos, 0.5 + fish.len);
           this.audio?.splash(0.5 + fish.weight * 0.1);
@@ -660,6 +669,7 @@ export class FishingRig {
         } else {
           // resting: hold against the current, head shakes
           F.set(-_f.x, 0, -_f.z).multiplyScalar(m * 0.9);
+          if (heft > 1) F.addScaledVector(fish.runDir, Fmax * 0.45 * (1 - 1 / heft) * fish.stamina);
           F.x += Math.sin(this.fightT * 9) * Fmax * 0.12;
           if (fish.stamina < 0.2) F.y += (surf - 0.25 - fish.pos.y) * 20; // exhausted fish come up
         }
@@ -679,11 +689,11 @@ export class FishingRig {
         }
         fish.fvel.addScaledVector(F, h / m);
         fish.pos.addScaledVector(fish.fvel, h);
-        const sN = waterY(fish.pos.z), bN = heightAt(fish.pos.x, fish.pos.z);
+        const sN = surfAt(fish.pos.x, fish.pos.z), bN = heightAt(fish.pos.x, fish.pos.z);
         if (fish.pos.y > sN - 0.08) { fish.pos.y = sN - 0.08; fish.fvel.y = Math.min(0, fish.fvel.y); }
         if (fish.pos.y < bN + 0.15) { fish.pos.y = bN + 0.15; fish.fvel.y = Math.max(0, fish.fvel.y); }
         // rocks
-        for (const r of riverRocks) {
+        for (const r of ENV.obstacles) {
           const dx = fish.pos.x - r.x, dz = fish.pos.z - r.z;
           const dd = Math.hypot(dx, dz);
           if (dd < r.r) { fish.pos.x = r.x + dx / dd * r.r; fish.pos.z = r.z + dz / dd * r.r; }
@@ -710,7 +720,7 @@ export class FishingRig {
     const rodSide = Math.abs(this.sideYaw);
     let side = 1 + rodSide * 0.9;
     if (fs > 0.3) side += Math.max(0, -fdir.normalize().dot(pull)) * 0.4 * rodSide;
-    const drain = (T * 0.006 * side + (fish.phase === 'run' ? Fmax * 0.003 : 0)) / (Math.pow(fish.weight, 0.8) * s.power + 0.15);
+    const drain = (T * 0.006 * side + (fish.phase === 'run' ? Fmax * 0.003 : 0)) / (Math.pow(fish.weight, 0.62) * s.power + 0.15) * 1.25 / Math.pow(heft, 0.6);
     fish.stamina = THREE.MathUtils.clamp(fish.stamina - drain * dt + (T < 2 ? 0.025 * dt : 0), 0, 1);
     // slack line -> hook can come loose
     if (T < 1.0) this.slackTime += dt; else this.slackTime = Math.max(0, this.slackTime - dt * 2);
@@ -718,7 +728,7 @@ export class FishingRig {
     if (T > breakN) { this._breakLine(`SNAP! The ${s.name.toLowerCase()} broke the line.`); return; }
     if (T > breakN * 0.9) this.overTime += dt; else this.overTime = 0;
     if (this.overTime > 1.2) { this._breakLine('The line gave way under strain!'); return; }
-    if (this.lineOut >= MAX_LINE) { this._breakLine('Spooled! The fish took all your line.'); return; }
+    if (this.lineOut >= maxLine()) { this._breakLine('Spooled! The fish took all your line.'); return; }
 
     fish.mouthPos.copy(fish.pos);
     fish.fightSpeed = fs;
@@ -726,7 +736,7 @@ export class FishingRig {
     const nd = _v.copy(fish.pos).sub(ctx.netPos); nd.y = 0;
     this.canNet = nd.length() < 4.2 && fish.pos.y > surf - 1.3;
     if (this.canNet && inp.net) {
-      if (fish.stamina < 0.3 || Math.random() < 0.25) this._startLanding(ctx);
+      if (fish.stamina < 0.3 || Math.random() < 0.25 / (heft * heft)) this._startLanding(ctx);
       else {
         this.hooks.notify('Too lively — tire it out first!', false);
         fish.phase = 'run'; fish.phaseT = 1.5; this._pickRun(fish);
@@ -739,7 +749,7 @@ export class FishingRig {
     this.hooks.notify(msg, true);
     if (this.fish) {
       this.lurePos.copy(this.fish.pos);
-      this.lurePos.y = Math.min(this.lurePos.y, waterY(this.lurePos.z) - 0.1);
+      this.lurePos.y = Math.min(this.lurePos.y, surfAt(this.lurePos.x, this.lurePos.z) - 0.1);
       this.lureVel.set(0, 0, 0);
       this.hooks.onLost(this.fish, 'unhooked');
       this.fish = null;
@@ -790,7 +800,7 @@ export class FishingRig {
       o.position.copy(this.lurePos);
       if (this.state === 'water') {
         const t = performance.now() * 0.001;
-        o.position.y = waterY(this.lurePos.z) - 0.03 - this.floatDip + Math.sin(t * 3 + this.lurePos.x) * 0.012;
+        o.position.y = surfAt(this.lurePos.x, this.lurePos.z) - 0.03 - this.floatDip + Math.sin(t * 3 + this.lurePos.x) * 0.012;
         o.rotation.set(Math.sin(t * 2.1) * 0.08, 0, Math.cos(t * 1.7) * 0.08 + this.floatDip * 0.6);
       } else {
         o.rotation.set(0, 0, 0);

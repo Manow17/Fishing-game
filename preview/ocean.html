@@ -1,0 +1,203 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Ocean preview</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}canvas{display:block}
+  #ui{position:fixed;left:8px;top:8px;color:#fff;font:12px/1.5 monospace;z-index:2;background:rgba(0,0,0,.45);padding:8px 10px;border-radius:6px;max-width:360px}
+  #ui button{font:11px monospace;margin:1px;padding:2px 6px;cursor:pointer}
+  #ui input[type=range]{width:170px;vertical-align:middle}
+  #mm{position:fixed;right:8px;top:8px;width:240px;height:240px;border-radius:50%;z-index:2;border:3px solid #6b5a3a;background:#ece3c6}
+  #snap{position:fixed;inset:0;width:100%;height:100%;object-fit:contain;z-index:5;display:none;background:#000}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <div id="msg">loading…</div>
+  <div>waves <input id="ws" type="range" min="0" max="4" step="0.05" value="1"> <span id="wsv">1.00</span></div>
+  <div id="views"></div>
+  <div><label><input id="probes" type="checkbox" checked> CPU probes</label> <label><input id="floats" type="checkbox" checked> floats</label></div>
+  <div>map radius <select id="mmr"><option>200</option><option>600</option><option>2000</option><option>4500</option></select></div>
+  <div id="stats"></div>
+</div>
+<canvas id="mm" width="480" height="480"></canvas>
+<img id="snap">
+<canvas id="c"></canvas>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { createRenderer, createComposer } from '../src/render.js';
+import { buildOceanWorld } from '../src/world/ocean/oceanWorld.js';
+import { ENV, setWaveScale } from '../src/world/env.js';
+
+const $ = (id) => document.getElementById(id);
+const renderer = createRenderer($('c'));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.12, 30000);
+const post = createComposer(renderer, scene, camera);
+const t0 = performance.now();
+const world = await buildOceanWorld(scene, renderer, (p, m) => $('msg').textContent = `${Math.round(p * 100)}% ${m}`);
+const buildS = (performance.now() - t0) / 1000;
+
+const sp = ENV.spawn;
+const sa = 24 * Math.PI / 180;   // sun azimuth (oceanSky.js SUN)
+const VIEWS = {
+  boat: [[1150, 2.4, 230], [1095, 0.3, 196]],
+  high: [[1080, 32, 280], [960, 0, 170]],
+  island: [[1650, 70, 760], [0, 30, 0]],
+  harbour: [[735, 16, 165], [690, 0, 50]],
+  spawn: [[sp.x - 8, 3.2, sp.z + 6], [sp.x + 10, 0.5, sp.z]],
+  lighthouse: [[-891, 62, 208], [-936, 60, 168]],
+  headland: [[-1280, 6, 20], [-936, 38, 168]],
+  reef: [[-760, 30, 820], [-700, -2, 560]],
+  beach: [[-60, 6, 800], [-60, 1, 560]],
+  glitter: [[1400, 3, -300], [1400 + Math.sin(sa) * 60, 0, -300 + Math.cos(sa) * 60]],
+  cliffs: [[-150, 25, -1000], [-200, 40, -500]],
+  offshore: [[2500, 3, 1500], [2400, 0, 1450]],
+};
+const controls = new OrbitControls(camera, renderer.domElement);
+function setView(name) {
+  const [p, t] = VIEWS[name];
+  camera.position.set(...p); controls.target.set(...t); controls.update();
+  world.updateReflections(camera.position, true);
+  history.replaceState(null, '', `?v=${name}&w=${ENV.waveScale}`);
+}
+for (const k of Object.keys(VIEWS)) {
+  const b = document.createElement('button'); b.textContent = k; b.onclick = () => setView(k); $('views').appendChild(b);
+}
+const qs = new URLSearchParams(location.search);
+setWaveScale(+(qs.get('w') ?? 1));
+$('ws').value = ENV.waveScale; $('wsv').textContent = ENV.waveScale.toFixed(2);
+$('ws').oninput = (e) => { setWaveScale(+e.target.value); $('wsv').textContent = ENV.waveScale.toFixed(2); };
+setView(VIEWS[qs.get('v')] ? qs.get('v') : 'boat');
+
+// ---- floating test boxes (ride ENV.surface: height + pitch/roll from 4 samples)
+const floats = [];
+const fmat = new THREE.MeshStandardMaterial({ color: 0xe8452c, roughness: 0.6 });
+const fmat2 = new THREE.MeshStandardMaterial({ color: 0xf2c14e, roughness: 0.6 });
+for (let i = 0; i < 5; i++) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(i === 0 ? 2.2 : 0.8, 0.5, i === 0 ? 5 : 0.8), i === 0 ? fmat : fmat2);
+  m.castShadow = true;
+  scene.add(m);
+  floats.push({ m, ox: [0, 6, -6, 4, -5][i], oz: [0, 4, 3, -6, -5][i], L: i === 0 ? 2.5 : 0.4 });
+}
+// ---- CPU probes: thin poles whose middle sits exactly at the CPU height (half above, half below water)
+const probeGeo = new THREE.CylinderGeometry(0.035, 0.035, 0.6, 6);
+const probeMat = new THREE.MeshBasicMaterial({ color: 0x00ff66 });
+const probes = new THREE.InstancedMesh(probeGeo, probeMat, 121);
+probes.frustumCulled = false;
+scene.add(probes);
+const _m = new THREE.Matrix4();
+const anchor = new THREE.Vector3();
+function updateTest() {
+  anchor.copy(controls.target);
+  for (const f of floats) {
+    f.m.visible = $('floats').checked;
+    const x = anchor.x + f.ox, z = anchor.z + f.oz, L = f.L;
+    const hb = ENV.surface(x, z + L), hs = ENV.surface(x, z - L), hp = ENV.surface(x - L, z), hq = ENV.surface(x + L, z);
+    f.m.position.set(x, (hb + hs + hp + hq) / 4, z);
+    f.m.rotation.set(Math.atan2(hs - hb, 2 * L), 0, Math.atan2(hq - hp, 2 * L));
+  }
+  probes.visible = $('probes').checked;
+  let k = 0;
+  for (let j = -5; j <= 5; j++) for (let i = -5; i <= 5; i++) {
+    const x = Math.round(anchor.x) + i * 2.5, z = Math.round(anchor.z) + j * 2.5;
+    _m.makeTranslation(x, ENV.surface(x, z), z);
+    probes.setMatrixAt(k++, _m);
+  }
+  probes.instanceMatrix.needsUpdate = true;
+}
+
+// ---- minimap, drawn exactly the way the HUD calls ENV.drawMap
+const mmCtx = $('mm').getContext('2d');
+function drawMinimap() {
+  const W = $('mm').width, R = W / 2, rad = +$('mmr').value, S = W / (2 * rad);
+  const me = { x: controls.target.x, z: controls.target.z };
+  const tx = (x) => R + (x - me.x) * S, ty = (z) => R + (z - me.z) * S;
+  mmCtx.setTransform(1, 0, 0, 1, 0, 0);
+  mmCtx.fillStyle = '#ece3c6'; mmCtx.fillRect(0, 0, W, W);
+  if (ENV.drawMap) ENV.drawMap(mmCtx, (x, z) => [tx(x), ty(z)], S, { x: me.x, z: me.z, reach: R / S + 14, u: W / 160, W });
+  mmCtx.fillStyle = '#e8452c'; mmCtx.beginPath(); mmCtx.arc(R, R, 5, 0, 7); mmCtx.fill();
+  const hm = world.layout.homeMark;
+  if (hm) { mmCtx.fillStyle = '#222'; mmCtx.font = '22px sans-serif'; mmCtx.fillText('⌂', tx(hm.x) - 7, ty(hm.z) + 7); }
+}
+let mmT = 0;
+
+// ---- loop + stats
+const clock = new THREE.Clock();
+let frames = 0, acc = 0, fps = 0, nanCheckT = 0;
+let paused = false;
+function frame(dt) {
+  controls.update();
+  world.update(dt, camera, controls.target);
+  world.updateReflections(camera.position);
+  updateTest();
+  post.render(dt);
+  if ((mmT -= dt) <= 0) { mmT = 0.2; drawMinimap(); }
+}
+renderer.setAnimationLoop(() => {
+  if (paused) return;
+  const dt = Math.min(clock.getDelta(), 0.05);
+  frame(dt);
+  frames++; acc += dt;
+  if (acc > 0.5) {
+    fps = frames / acc; frames = 0; acc = 0;
+    const ri = renderer.info.render;
+    $('stats').textContent = `build ${buildS.toFixed(2)} s · ${fps.toFixed(0)} fps · ${(ri.triangles / 1e6).toFixed(2)} M tris · ${ri.calls} calls · t ${ENV.time.toFixed(1)}`;
+  }
+});
+$('msg').textContent = `built in ${buildS.toFixed(2)} s`;
+
+// Screenshot helper: render, copy the canvas into a full-screen <img> (WebGL canvases can read stale)
+window.__snap = async (show = true) => {
+  frame(1 / 60);
+  const url = renderer.domElement.toDataURL('image/jpeg', 0.9);
+  if (show) { $('snap').src = url; $('snap').style.display = 'block'; await $('snap').decode().catch(() => {}); }
+  return url.length;
+};
+window.__unsnap = () => { $('snap').style.display = 'none'; };
+window.__setView = (v, w) => { if (w !== undefined) { setWaveScale(w); $('ws').value = w; $('wsv').textContent = (+w).toFixed(2); } setView(v); };
+window.__pause = (p) => { paused = p; };
+window.__step = (n = 30, dt = 1 / 30) => { for (let i = 0; i < n; i++) frame(dt); };
+// GPU+CPU frame cost: render n frames back to back, forcing completion with gl.finish()
+window.__perf = (n = 30, w = 0, h = 0) => {
+  const gl = renderer.getContext();
+  const pw = innerWidth, ph = innerHeight, pr = renderer.getPixelRatio();
+  if (w) { renderer.setPixelRatio(1); renderer.setSize(w, h, false); post.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix(); }
+  frame(1 / 60); gl.finish();
+  renderer.info.autoReset = false;
+  const t = performance.now();
+  let tris = 0, calls = 0;
+  for (let i = 0; i < n; i++) { renderer.info.reset(); frame(1 / 60); tris += renderer.info.render.triangles; calls += renderer.info.render.calls; }
+  gl.finish();
+  const ms = (performance.now() - t) / n;
+  renderer.info.autoReset = true;
+  const out = { ms: +ms.toFixed(2), fpsEq: +(1000 / ms).toFixed(0), Mtris: +(tris / n / 1e6).toFixed(2), calls: Math.round(calls / n), w: renderer.domElement.width, h: renderer.domElement.height };
+  if (w) { renderer.setPixelRatio(pr); renderer.setSize(pw, ph); post.setSize(pw, ph); camera.aspect = pw / ph; camera.updateProjectionMatrix(); }
+  return out;
+};
+// Render at a fixed size and hand the JPEG to a local receiver (for headless checks when the tab is hidden)
+window.__shot = async (name, w = 1280, h = 720, url = 'http://localhost:5199/save') => {
+  const pw = innerWidth, ph = innerHeight, pr = renderer.getPixelRatio();
+  renderer.setPixelRatio(1); renderer.setSize(w, h, false); post.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
+  frame(1 / 60); frame(1 / 60);
+  const data = renderer.domElement.toDataURL('image/jpeg', 0.85);
+  renderer.setPixelRatio(pr); renderer.setSize(pw, ph); post.setSize(pw, ph); camera.aspect = pw / ph; camera.updateProjectionMatrix();
+  const r = await fetch(`${url}?name=${encodeURIComponent(name)}`, { method: 'POST', body: data });
+  return r.text();
+};
+window.__post = post;
+window.__world = world; window.__cam = camera; window.__controls = controls; window.__renderer = renderer; window.__ENV = ENV; window.__scene = scene;
+// NaN / black-pixel probe: reads the composer's last frame at low res
+window.__stats = () => ({ build: buildS, fps, tris: renderer.info.render.triangles, calls: renderer.info.render.calls, geoms: renderer.info.memory.geometries, tex: renderer.info.memory.textures });
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); post.setSize(innerWidth, innerHeight); });
+</script>
+</body>
+</html>

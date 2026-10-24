@@ -132,6 +132,7 @@ const vert = /* glsl */`
   varying vec4 vData;
   varying float vWave;
   uniform float uTime;
+  uniform float uWaveScale;
   #include <fog_pars_vertex>
   void main() {
     vUv = uv;
@@ -139,11 +140,11 @@ const vert = /* glsl */`
     vec3 p = position;
     float speed = aData.y;
     float rp = aData.z;
-    // standing waves in rapids + gentle travelling chop
-    float w = 0.0;
-    w += sin(p.z * 0.9 + p.x * 0.3 - uTime * 2.1) * 0.03;
-    w += sin(p.z * 0.37 - p.x * 0.55 + uTime * 1.3) * 0.04;
-    w += rp * (sin(p.z * 1.6 + sin(p.x * 0.7) * 1.5) * 0.18 + sin(p.x * 2.1 + p.z * 0.8 + uTime * 3.0) * 0.08) * (1.0 - smoothstep(0.3, 1.0, abs(aData.w)));
+    // waves: ripples, lobby-controlled swell, standing waves in rapids (CPU twin: riverWave() in river.js)
+    float S = uWaveScale, S2 = max(S - 1.0, 0.0);
+    float w = (sin(p.z * 0.9 + p.x * 0.3 - uTime * 2.1) * 0.03 + sin(p.z * 0.37 - p.x * 0.55 + uTime * 1.3) * 0.04) * S;
+    w += S2 * (sin(p.z * 0.11 + p.x * 0.05 - uTime * 0.9) * 0.28 + sin(p.z * 0.071 - p.x * 0.13 + uTime * 0.7) * 0.22 + sin(p.x * 0.09 + p.z * 0.03 - uTime * 1.1) * 0.12);
+    w += rp * (sin(p.z * 1.6 + sin(p.x * 0.7) * 1.5) * 0.18 + sin(p.x * 2.1 + p.z * 0.8 + uTime * 3.0) * 0.08) * (1.0 - smoothstep(0.3, 1.0, abs(aData.w))) * min(1.5, 0.4 + S * 0.6);
     float shore = 1.0 - smoothstep(0.05, 0.5, aData.x);
     w *= 1.0 - shore;
     p.y += w;
@@ -158,6 +159,7 @@ const vert = /* glsl */`
 
 const frag = /* glsl */`
   uniform float uTime;
+  uniform float uWaveScale;
   uniform sampler2D tNormal, tNormal2, tFoam, tFoamMap;
   uniform samplerCube tEnv;
   uniform vec3 uSunDir, uSunColor, uDeep, uShallow, uScatter;
@@ -195,7 +197,7 @@ const frag = /* glsl */`
     vec3 nA = flowNormal(tNormal, ruv, drift, 0.085);
     vec3 nB = flowNormal(tNormal2, ruv * vec2(1.0, 0.6), drift * 1.15, 0.23);
     vec3 nC = flowNormal(tNormal, ruv.yx, 0.11, 0.6);
-    float chop = 0.38 + speed * 0.14 + rp * 0.8;
+    float chop = (0.38 + speed * 0.14 + rp * 0.8) * (0.25 + 0.75 * min(uWaveScale, 1.0)) + max(uWaveScale - 1.0, 0.0) * 0.35;
     vec3 n = normalize(vec3((nA.xy * 0.8 + nB.xy * 0.6 + nC.xy * 0.3) * chop, 1.0));
     vec3 N = normalize(vec3(n.x, n.z, n.y));
 
@@ -266,6 +268,7 @@ export function createWater(scene, sharedTime) {
 
   const uniforms = THREE.UniformsUtils.merge([THREE.UniformsLib.fog, {
     uTime: { value: 0 },
+    uWaveScale: { value: 1 },
     tNormal: { value: null }, tNormal2: { value: null }, tFoam: { value: null }, tFoamMap: { value: null },
     tEnv: { value: null },
     uSunDir: { value: new THREE.Vector3(0, 1, 0) },
@@ -316,6 +319,7 @@ export function createWater(scene, sharedTime) {
   return {
     material: mat,
     meshes,
+    setWaveScale(v) { uniforms.uWaveScale.value = v; },
     setSun(dir, color) { uniforms.uSunDir.value.copy(dir); uniforms.uSunColor.value.copy(color); },
     setEnv(cube) { uniforms.tEnv.value = cube; },
     // drop a foam "stamp" (boat wakes, splashes). radius in meters.

@@ -6,6 +6,7 @@ import { LURE_INFO } from '../models/lures.js';
 import { DRAG_KG } from './fishing.js';
 import { centerX, centerSlope, halfWidth, riverRocks, rapids } from '../world/river.js';
 import * as RIVER from '../world/river.js'; // TRIBUTARIES / ISLANDS (read defensively; may be filled later)
+import { ENV } from '../world/env.js';
 
 const $ = (id) => document.getElementById(id);
 const COMPASS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
@@ -79,6 +80,10 @@ export class Hud {
       ctx.fillRect(0, 0, W, W);
     }
 
+    if (ENV.drawMap) {
+      // maps other than the river paint their own water and land
+      ENV.drawMap(ctx, (x, z) => [tx(x), ty(z)], S, { x: me.x, z: me.z, reach, u, W });
+    } else {
     // main river, sampled on a world-aligned grid so the outline doesn't shimmer
     const bodies = [];
     const zs = [], xl = [], xr = [], cs = [], hws = [], zw = [];
@@ -180,6 +185,7 @@ export class Hud {
       ctx.moveTo(x + rr, y); ctx.arc(x, y, rr, 0, TAU);
     }
     ctx.fill();
+    }
 
     // 100 m range ring
     ctx.strokeStyle = 'rgba(34, 48, 42, 0.3)';

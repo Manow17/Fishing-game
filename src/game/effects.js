@@ -1,6 +1,7 @@
 // Splashes, droplets, ripple rings and boat spray.
 import * as THREE from 'three';
-import { waterY, flowAt } from '../world/river.js';
+import { ENV } from '../world/env.js';
+const flowAt = (x, z, out) => ENV.flowAt(x, z, out);
 
 const _f = {};
 
@@ -66,7 +67,7 @@ export class Effects {
 
   splash(p, size = 0.4) {
     const n = Math.round(20 + size * 60);
-    const wy = waterY(p.z);
+    const wy = ENV.surface(p.x, p.z);
     for (let i = 0; i < n; i++) {
       const a = Math.random() * Math.PI * 2, r = Math.random() * size * 0.4;
       const up = 1.2 + Math.random() * 2.8 * (0.5 + size);
@@ -79,7 +80,7 @@ export class Effects {
   ring(p, maxR = 1.2) {
     const mat = new THREE.ShaderMaterial({ uniforms: { uLife: { value: 1 } }, vertexShader: ringVert, fragmentShader: ringFrag, transparent: true, depthWrite: false });
     const m = new THREE.Mesh(this.ringGeo, mat);
-    m.position.set(p.x, waterY(p.z) + 0.03, p.z);
+    m.position.set(p.x, ENV.surface(p.x, p.z) + 0.03, p.z);
     m.renderOrder = 3;
     this.scene.add(m);
     this.rings.push({ m, t: 0, maxR, dur: 1.4 + maxR * 0.3 });
@@ -109,14 +110,14 @@ export class Effects {
         this.sprayAcc -= 1;
         const side = Math.random() < 0.5 ? -1 : 1;
         const bx = phys.x + fx * 2.6, bz = phys.z + fz * 2.6;
-        const wy = waterY(bz);
+        const wy = ENV.surface(bx, bz);
         this._emit(bx + side * fz * 0.5, wy + 0.1, bz - side * fx * 0.5, side * fz * 1.5 + phys.vx * 0.6, 1 + Math.random() * 1.5, -side * fx * 1.5 + phys.vz * 0.6);
       }
     }
     // propeller wash
     if (Math.abs(phys.throttle) > 0.1 && Math.random() < dt * 30 * Math.abs(phys.throttle)) {
       const sx = phys.x - fx * 3.9, sz = phys.z - fz * 3.9;
-      this._emit(sx, waterY(sz) + 0.05, sz, -fx * 2 * phys.throttle + (Math.random() - 0.5), 0.6 + Math.random(), -fz * 2 * phys.throttle + (Math.random() - 0.5));
+      this._emit(sx, ENV.surface(sx, sz) + 0.05, sz, -fx * 2 * phys.throttle + (Math.random() - 0.5), 0.6 + Math.random(), -fz * 2 * phys.throttle + (Math.random() - 0.5));
     }
   }
 
@@ -127,7 +128,7 @@ export class Effects {
       this.vel[k + 1] -= 9.81 * dt;
       this.pos[k] += this.vel[k] * dt; this.pos[k + 1] += this.vel[k + 1] * dt; this.pos[k + 2] += this.vel[k + 2] * dt;
       this.life[i] -= dt * 1.1;
-      if (this.pos[k + 1] < waterY(this.pos[k + 2]) - 0.05) this.life[i] = 0;
+      if (this.pos[k + 1] < ENV.surface(this.pos[k], this.pos[k + 2]) - 0.05) this.life[i] = 0;
     }
     this.drops.geometry.attributes.position.needsUpdate = true;
     this.drops.geometry.attributes.aLife.needsUpdate = true;

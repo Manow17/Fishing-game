@@ -1,4 +1,5 @@
 // Orchestrates player, boat, fishing, fish, camera, HUD, audio and multiplayer.
+// Everything about the water/land comes from the active map through ENV (see world/env.js).
 import * as THREE from 'three';
 import { Input } from './input.js';
 import { Audio } from './audio.js';
@@ -8,19 +9,22 @@ import { BoatPhysics } from './boatPhysics.js';
 import { FishingRig } from './fishing.js';
 import { FishManager } from './fishAI.js';
 import { SPECIES, pointsFor } from './species.js';
-import { RemotePlayer, colorFor } from './remote.js';
+import { RemotePlayer } from './remote.js';
 import { Network } from '../net/network.js';
-import { createBoat, createLandingNet } from '../models/boat.js';
-import { createAngler } from '../models/angler.js';
+import { createLandingNet } from '../models/boat.js';
 import { createFish } from '../models/fish.js';
 import { LURE_TYPES } from '../models/lures.js';
-import { centerX, waterY, flowAt, rapids, PLAY_Z } from '../world/river.js';
-import { SPAWN_Z, VILLAGE_SIDE, bankX } from '../world/layout.js';
+import { ENV, setWaveScale, MAPS } from '../world/env.js';
 import { Land, BRAID } from './land.js';
+import { loadLook, saveLook } from './look.js';
+import { buildBoat, disposeBoat, buildAngler, placeAngler, seatWorld } from './rigging.js';
+import { Workshop } from './workshop.js';
+import { Settings, QUALITY, loadGfx, waveName } from './settings.js';
 
-const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _q = new THREE.Quaternion();
+const _v = new THREE.Vector3(), _v2 = new THREE.Vector3();
 const _f = {};
 const $ = (id) => document.getElementById(id);
+const wrapPi = (a) => { while (a > Math.PI) a -= Math.PI * 2; while (a < -Math.PI) a += Math.PI * 2; return a; };
 
 export class Game {
   constructor({ renderer, scene, camera, world, post }) {
@@ -31,9 +35,12 @@ export class Game {
     this.aimRel = 0; this.aimPitch = -0.05;
     this.remotes = new Map();
     this.netTimer = 0;
+    this.netTick = 0;
     this.time = 0;
     this.crateFish = [];
     this.pendingCatch = null;
+    this.ride = null;             // { id, seat } while riding along in another player's boat
+    this.bodyYaw = 0;
   }
 
   async init() {
@@ -42,28 +49,25 @@ export class Game {
     this.hud = new Hud();
     this.effects = new Effects(this.scene, this.world.water);
 
-    // spawn beside the end of the village dock
-    const dockEndX = bankX(SPAWN_Z, VILLAGE_SIDE, 1.5) - VILLAGE_SIDE * 16;
-    this.phys = new BoatPhysics(dockEndX, SPAWN_Z, Math.PI);
+    this.name = localStorage.getItem('af-name') || '';
+    this.color = Number(localStorage.getItem('af-color')) || [0xe8452c, 0x2f7de1, 0xf2c14e, 0x7ad66b, 0xb06ae8][(Math.random() * 5) | 0];
+    localStorage.setItem('af-color', this.color);
+    this.look = loadLook(this.color);
+    this.gfx = loadGfx();
+
+    // spawn beside the map's harbour dock
+    const sp = ENV.spawn;
+    this.phys = new BoatPhysics(sp.x, sp.z, sp.h);
     this.phys.setAnchor(true);
-    // dock pilings are obstacles for the boat
     for (const d of this.world.layout.docks) for (let i = 0; i <= 7; i++) {
       this.phys.obstacles.push({ x: d.x + Math.sin(d.yaw) * i * 2, z: d.z + Math.cos(d.yaw) * i * 2, r: 1.1 });
     }
 
-    this.name = localStorage.getItem('af-name') || '';
-    this.color = Number(localStorage.getItem('af-color')) || [0xe8452c, 0x2f7de1, 0xf2c14e, 0x7ad66b, 0xb06ae8][(Math.random() * 5) | 0];
-    localStorage.setItem('af-color', this.color);
-
-    this.boat = createBoat({ accent: this.color });
-    this.scene.add(this.boat.object);
-    this.angler = createAngler({ vest: 0x5b6b3a, shirt: 0x8a2f2a, hat: 0xc9b98f, name: this.name || 'You' });
-    this.angler.setName?.(''); // others see your tag; you don't need it over your own head
-    this.boat.object.add(this.angler.object);
-    if (!this.boat.waterMask) this._addWaterMask(this.boat);
     this.net = createLandingNet();
-    this.boat.object.add(this.net.object);
-    this._restNet();
+    this._makeBoat();
+    this.angler = buildAngler(this.look.angler, this.name || 'You');
+    this.angler.setName?.(''); // others see your tag; you don't need it over your own head
+    this.scene.add(this.angler.object);
 
     this.fishMgr = new FishManager(this.scene);
     this.rig = new FishingRig(this.scene, this.audio, {
@@ -87,7 +91,7 @@ export class Game {
     this.applyUpgrades();
 
     // trophy view for the catch card
-    this.trophy = { scene: new THREE.Scene(), camera: new THREE.PerspectiveCamera(30, 1, 0.01, 50), fish: null, t: 0 };
+    this.trophy = { scene: new THREE.Scene(), camera: new THREE.PerspectiveCamera(30, 1, 0.01, 200), fish: null, t: 0 };
     const ts = this.trophy.scene;
     ts.environment = this.scene.environment;
     ts.environmentIntensity = 0.55;
@@ -100,12 +104,120 @@ export class Game {
       onLeave: (id) => this._removeRemote(id),
       onState: (id, s) => { if (!this.remotes.has(id)) this._addRemote(id, { name: 'Angler' }); this.remotes.get(id).setState(s); },
       onEvent: (id, ev) => this._onNetEvent(id, ev),
-      onStatus: (t) => this.hud.notify(t, true),
+      onStatus: (t) => { this.hud.notify(t, true); const ms = $('menu-status'); if (ms && this.mode === 'menu') ms.textContent = t; },
     });
 
+    this.workshop = new Workshop(this);
+    this.settings = new Settings(this);
     this._bindUI();
     this._bindCheat();
+    this.applyGfx();
     this._syncBoat(0);
+  }
+
+  // ------------------------------------------------------------------ boat & look
+  _makeBoat() {
+    const old = this.boat;
+    this.boat = buildBoat(this.look.boat, this.color);
+    this.scene.add(this.boat.object);
+    if (!this.boat.waterMask) this._addWaterMask(this.boat);
+    this.boat.object.add(this.net.object);
+    this._restNet();
+    this.phys.setHull(this.boat.phys, this.boat.size);
+    if (old) {
+      // carry the kept fish over to the new crate
+      for (const c of this.crateFish) { old.crate.remove(c.holder); this.boat.crate.add(c.holder); }
+      disposeBoat(old, this.scene);
+    }
+    this._boatKey = `${this.look.boat.type}|${this.look.boat.size}`;
+  }
+
+  // the boat object of any player id (me or a remote)
+  boatOf(id) {
+    if (id === this.network.myId) return this.boat;
+    return this.remotes.get(id)?.boat || null;
+  }
+
+  // apply the (workshop-edited) look to my boat and angler, and tell everyone
+  applyLook() {
+    saveLook(this.look);
+    if (`${this.look.boat.type}|${this.look.boat.size}` !== this._boatKey) this._makeBoat();
+    else { this.boat.setPaint?.(this.look.boat.paint ?? null); this.boat.setAccent?.(this.look.boat.accent); }
+    const key = JSON.stringify(this.look.angler);
+    if (key !== this._anglerKey) {
+      this._anglerKey = key;
+      if (this.angler.setOutfit) this.angler.setOutfit({ ...this.look.angler });
+      else {
+        this.scene.remove(this.angler.object);
+        this.angler = buildAngler(this.look.angler, this.name);
+        this.angler.setName?.('');
+        this.scene.add(this.angler.object);
+      }
+    }
+    this.applyUpgrades();
+    this.network.updateInfo(this._myInfo());
+    this._lookDirty = true;
+  }
+
+  _myInfo() {
+    return { name: this.name, color: this.color, look: this.look, map: ENV.id, waves: ENV.waveScale };
+  }
+
+  applyUpgrades() {
+    const L = this.land;
+    this.boat.setPaint?.(this.look.boat.paint ?? null);
+    // drag grows with speed squared, so thrust scales with the square of the wanted speed factor
+    this.phys.thrustMult = L.thrustMult * (this.cheatSpeed || 1) ** 2;
+    this.rig.lineBreakKg = ENV.tackle.lineBreakKg * (L.braid ? BRAID.breakKg / 7.2 : 1);
+  }
+
+  applyGfx() {
+    const q = QUALITY.find(o => o.id === this.gfx.quality) || QUALITY[2];
+    const pr = Math.max(0.5, Math.min(3, Math.min(window.devicePixelRatio || 1, 2) * q.scale));
+    this.post.setPixelRatio?.(pr);
+    this.post.setSharpen?.(this.gfx.sharpen);
+    localStorage.setItem('af-gfx', JSON.stringify(this.gfx));
+  }
+
+  // ------------------------------------------------------------------ lobby: waves + map
+  broadcastSettings() {
+    if (this.network.active && this.network.isHost) {
+      this.network.sendEvent({ type: 'settings', waveScale: ENV.waveScale });
+      this.network.updateInfo(this._myInfo());
+    }
+  }
+
+  // Maps are built at page load: switching reloads; a lobby owner brings the whole lobby along.
+  switchMap(id) {
+    if (!MAPS.some(m => m.id === id)) return;
+    const n = this.network;
+    if (n.active && !n.isHost) { this.hud.notify('Only the lobby owner can change the map', false); return; }
+    const q = new URLSearchParams({ map: id });
+    if (this.name) q.set('name', this.name);
+    if (n.active && n.isHost) {
+      n.sendEvent({ type: 'map', map: id, code: n.code });
+      q.set('host', n.code);
+      q.set('waves', ENV.waveScale);
+    }
+    setTimeout(() => { location.search = q.toString(); }, n.active ? 400 : 0);
+  }
+
+  // URL actions after a map switch: re-open the same lobby, or rejoin it
+  async autoStart() {
+    const q = new URLSearchParams(location.search);
+    if (q.get('name')) { this.name = q.get('name'); $('inp-name').value = this.name; }
+    if (q.get('waves')) setWaveScale(+q.get('waves'));
+    if (q.get('host')) {
+      $('menu-status').textContent = 'Re-opening your lobby…';
+      try {
+        const code = await this.network.host(this._myInfo(), q.get('host'));
+        this.hud.setLobby(code);
+        this._startPlay();
+      } catch (e) { $('menu-status').textContent = 'Could not re-open the lobby: ' + (e.message || e.type || e); }
+    } else if (q.get('join')) {
+      $('inp-code').value = q.get('join');
+      this._join(q.get('join'), 12);
+    }
   }
 
   // ------------------------------------------------------------------ hidden cheat (bottom-right corner)
@@ -174,7 +286,7 @@ export class Game {
       start();
       $('menu-status').textContent = 'Opening a lobby…';
       try {
-        const code = await this.network.host({ name: this.name, color: this.color });
+        const code = await this.network.host(this._myInfo());
         this.hud.setLobby(code);
         this._startPlay();
         this.hud.notify(`Lobby open — share code ${code} with friends`, true);
@@ -182,22 +294,19 @@ export class Game {
         $('menu-status').textContent = 'Could not open a lobby: ' + (e.message || e.type || e);
       }
     };
-    $('btn-join').onclick = async () => {
+    $('btn-join').onclick = () => {
       start();
       const code = $('inp-code').value.trim().toUpperCase();
       if (code.length < 4) { $('menu-status').textContent = 'Enter the lobby code from your friend'; return; }
-      $('menu-status').textContent = 'Joining…';
-      try {
-        await this.network.join(code, { name: this.name, color: this.color });
-        this.hud.setLobby(code);
-        // spread out boats a little
-        this.phys.x += (Math.random() - 0.5) * 20; this.phys.z += 15 + Math.random() * 30;
-        this.phys.setAnchor(true);
-        this._startPlay();
-      } catch (e) {
-        $('menu-status').textContent = 'Join failed: ' + (e.message || e.type || e);
-      }
+      this._join(code, 0);
     };
+    // map choice, workshop and settings from the menu
+    document.querySelectorAll('[data-menu-map]').forEach(b => {
+      b.classList.toggle('on', b.dataset.menuMap === ENV.id);
+      b.onclick = () => { start(); if (b.dataset.menuMap !== ENV.id) this.switchMap(b.dataset.menuMap); };
+    });
+    $('btn-workshop')?.addEventListener('click', () => { start(); this.workshop.show(); });
+    $('btn-settings')?.addEventListener('click', () => this.settings.show());
     const chat = $('chat-input');
     chat.addEventListener('keydown', (e) => {
       e.stopPropagation();
@@ -212,10 +321,28 @@ export class Game {
         if (e.code === 'KeyK') this._resolveCatch(true);
         if (e.code === 'KeyR') this._resolveCatch(false);
       }
+      if (e.code === 'Escape') {
+        if (this.workshop.open) this.workshop.close();
+        if (this.settings.open) this.settings.close();
+      }
     });
     this.input.onLockChange = (locked) => {
-      if (!locked && this.mode !== 'menu' && !this.hud.overlayOpen && !this.chatOpen) this.hud.notify('Click to resume', false);
+      if (!locked && this.mode !== 'menu' && !this._overlay() && !this.chatOpen) this.hud.notify('Click to resume', false);
     };
+  }
+
+  async _join(code, retries) {
+    $('menu-status').textContent = 'Joining…';
+    try {
+      await this.network.join(code, this._myInfo(), retries);
+      this.hud.setLobby(code);
+      // spread out boats a little
+      this.phys.x += (Math.random() - 0.5) * 20; this.phys.z += 15 + Math.random() * 30;
+      this.phys.setAnchor(true);
+      this._startPlay();
+    } catch (e) {
+      $('menu-status').textContent = 'Join failed: ' + (e.message || e.type || e);
+    }
   }
 
   showMenu() {
@@ -234,8 +361,10 @@ export class Game {
     this.camYaw = this.phys.h;
     this._refreshPlayers();
     if (!localStorage.getItem('af-helped')) { this.hud.toggleHelp(true); localStorage.setItem('af-helped', '1'); }
-    this.hud.notify('W/S throttle · A/D steer · Q anchor · F to fish', true);
+    this.hud.notify('W/S throttle · A/D steer · Q anchor · F to fish · U workshop · O settings', true);
   }
+
+  _overlay() { return this.hud.overlayOpen || this.workshop.open || this.settings.open; }
 
   _openChat() {
     this.chatOpen = true;
@@ -258,14 +387,26 @@ export class Game {
   // ------------------------------------------------------------------ multiplayer
   _addRemote(id, info) {
     if (id === this.network.myId) return;
-    if (this.remotes.has(id)) { const r = this.remotes.get(id); r.info = info; r.angler.setName?.(info.name); this._refreshPlayers(); return; }
+    // the lobby owner's map/waves rule: follow them
+    if (info?.isHost && !this.network.isHost) {
+      if (info.map && info.map !== ENV.id) {
+        const q = new URLSearchParams({ map: info.map, join: this.network.code, name: this.name });
+        this.hud.notify('Travelling to the lobby\'s map…', true);
+        this.network.leave();
+        setTimeout(() => { location.search = q.toString(); }, 300);
+        return;
+      }
+      if (info.waves != null) setWaveScale(info.waves);
+    }
+    if (this.remotes.has(id)) { this.remotes.get(id).setInfo(info); this._refreshPlayers(); return; }
     this.remotes.set(id, new RemotePlayer(this.scene, id, info, this));
-    this.hud.notify(`${info.name || 'An angler'} joined the river`, false);
+    this.hud.notify(`${info.name || 'An angler'} joined`, false);
     this._refreshPlayers();
   }
   _removeRemote(id) {
     const r = this.remotes.get(id);
     if (!r) return;
+    if (this.ride?.id === id) this._leaveRide('Your skipper left — back in your own boat');
     r.dispose();
     this.remotes.delete(id);
     this.hud.notify(`${r.info.name || 'An angler'} left`, false);
@@ -284,6 +425,62 @@ export class Game {
       const sp = SPECIES[ev.species];
       this.hud.notify(`🎣 ${name} landed a ${ev.weight.toFixed(2)} kg ${sp?.name || ev.species}!`, true);
     }
+    if (ev.type === 'info' && r) r.setInfo(ev.info);
+    if (ev.type === 'settings' && r?.info.isHost) {
+      setWaveScale(ev.waveScale);
+      this.hud.notify(`Lobby waves: ${waveName(ev.waveScale)}`, false);
+      if (this.settings.open) this.settings.render();
+    }
+    if (ev.type === 'map' && r?.info.isHost) {
+      const q = new URLSearchParams({ map: ev.map, join: ev.code, name: this.name });
+      this.hud.notify('The lobby owner is moving everyone to a new map…', true);
+      setTimeout(() => { location.search = q.toString(); }, 600);
+    }
+  }
+
+  // ------------------------------------------------------------------ riding along
+  _rideCandidate() {
+    const P = this.phys;
+    let best = null, bestD = Infinity;
+    for (const r of this.remotes.values()) {
+      if (!r.s || r.s.ride || r.s.m === 'walk') continue;
+      const d = Math.hypot(r.pos.x - P.x, r.pos.z - P.z);
+      const reach = (r.boat.length || 7.5) * r.boat.size * 0.5 + P.halfLen + 3;
+      if (d < reach && d < bestD) { best = r; bestD = d; }
+    }
+    return best;
+  }
+
+  _startRide(r) {
+    // first free passenger seat
+    const used = new Set();
+    for (const o of this.remotes.values()) if (o !== r && o.s?.ride?.[0] === r.id) used.add(o.s.ride[1]);
+    const seats = r.boat.passengerSeats.length;
+    let seat = -1;
+    for (let i = 0; i < seats; i++) if (!used.has(i)) { seat = i; break; }
+    if (seat < 0) { this.hud.notify(`${r.info.name}'s boat is full`, false); return; }
+    this.ride = { id: r.id, seat };
+    const P = this.phys;
+    P.throttle = 0; P.steer = 0; P.moored = true;
+    if (!P.anchored) { P.setAnchor(true); this.boat.setAnchor(true); }
+    this.aimRel = 0;
+    this.hud.notify(`Aboard ${r.info.name || 'their'}'s boat — F to fish, G to go back to yours`, true);
+    this.audio.footstep?.('wood');
+  }
+
+  _leaveRide(msg = 'Back in your own boat') {
+    if (!this.ride) return;
+    if (this.rig.state !== 'idle') this.rig._toIdle?.();
+    this.ride = null;
+    this.phys.moored = false;
+    if (this.mode === 'fish') { this.mode = 'drive'; this.rig.setVisible(false); }
+    this.hud.notify(msg, false);
+  }
+
+  // the boat I'm standing in (mine, or my skipper's)
+  _platform() {
+    if (this.ride) { const b = this.boatOf(this.ride.id); if (b) return b; }
+    return this.boat;
   }
 
   // ------------------------------------------------------------------ catching
@@ -336,8 +533,9 @@ export class Game {
     } else {
       f.inCrate = false;
       f.model.object.visible = true;
-      f.pos.copy(this.rig.tipPos); f.pos.y = waterY(f.pos.z) - 0.3;
-      const side = _v.set(Math.cos(this.phys.h), 0, -Math.sin(this.phys.h));
+      f.pos.copy(this.rig.tipPos); f.pos.y = ENV.waterLevel(f.pos.x, f.pos.z) - 0.3;
+      const h = this._platform().object.rotation.y;
+      const side = _v.set(Math.cos(h), 0, -Math.sin(h));
       f.pos.addScaledVector(side, 1.2);
       f.fleeDir = side.clone();
       this.fishMgr.release(f);
@@ -347,7 +545,7 @@ export class Game {
     this.input.requestLock();
   }
 
-  // Depth-only footprint at the waterline so the river surface doesn't show inside the hull.
+  // Depth-only footprint at the waterline so the water surface doesn't show inside the hull.
   _addWaterMask(boat) {
     const L = boat.length || 7.5, B = boat.beam || 1.6;
     const shape = new THREE.Shape();
@@ -388,22 +586,14 @@ export class Game {
     this.crateFish.push({ model: m, holder });
     if (this.crateFish.length > 6) {
       const old = this.crateFish.shift();
-      this.boat.crate.remove(old.holder);
+      old.holder.parent?.remove(old.holder);
       old.model.dispose();
     }
   }
 
   clearCrateModels() {
-    for (const c of this.crateFish) { this.boat.crate.remove(c.holder); c.model.dispose(); }
+    for (const c of this.crateFish) { c.holder.parent?.remove(c.holder); c.model.dispose(); }
     this.crateFish = [];
-  }
-
-  applyUpgrades() {
-    const L = this.land;
-    this.boat.setPaint(L.paint);
-    // drag grows with speed squared, so thrust scales with the square of the wanted speed factor
-    this.phys.maxThrust = 2100 * L.thrustMult * (this.cheatSpeed || 1) ** 2;
-    this.rig.lineBreakKg = L.braid ? BRAID.breakKg : 7.2;
   }
 
   // ------------------------------------------------------------------ going ashore / boarding
@@ -423,11 +613,8 @@ export class Game {
     const P = this.phys;
     P.moored = false;
     this.mode = 'drive';
-    const a = this.angler;
-    this.scene.remove(a.object);
-    this.boat.object.add(a.object);
-    a.setStance('sit');
-    a.setWalk(0, 0);
+    this.angler.setStance('sit');
+    this.angler.setWalk(0, 0);
     this.camYaw = this.land.camYaw;
     this.audio.footstep?.('wood');
     this.hud.notify('Back aboard', false);
@@ -444,18 +631,18 @@ export class Game {
     this.time += dt;
     const inp = this.input;
     const playing = this.mode !== 'menu';
-    const blocked = this.hud.overlayOpen || this.chatOpen;
+    const blocked = this._overlay() || this.chatOpen;
     const walking = this.mode === 'walk';
 
     if (playing && !blocked) this._handleKeys();
     if (playing && !this.chatOpen && inp.hit('KeyJ')) this.hud.toggleJournal(this.journal);
     if (playing && !this.chatOpen && inp.hit('KeyH')) this.hud.toggleHelp();
     if (playing && !blocked && (inp.hit('Enter') || inp.hit('KeyT'))) this._openChat();
-
-    // ---- boat control
-    const P = this.phys;
     if (inp.hit('Escape') && this.land.shopOpen) this.land.closeShop();
-    if (this.mode === 'drive' && !blocked) {
+
+    // ---- boat control (not while riding in someone else's boat)
+    const P = this.phys;
+    if (this.mode === 'drive' && !this.ride && !blocked) {
       const tRate = 0.9 * dt;
       if (inp.down('KeyW')) P.throttle = Math.min(1, P.throttle + tRate);
       if (inp.down('KeyS')) P.throttle = Math.max(-0.5, P.throttle - tRate);
@@ -469,13 +656,16 @@ export class Game {
     }
     P.step(dt);
     if (P.bump > 0.8) { this.audio.bump(P.bump); this.camShake = Math.min(1, P.bump * 0.2); }
+    if (P.slam > 0.4 && !this.ride) this.camShake = Math.max(this.camShake || 0, Math.min(0.6, P.slam * 0.4));
     P.bump = 0;
     // boats bump into each other
     for (const r of this.remotes.values()) {
       const dx = P.x - r.pos.x, dz = P.z - r.pos.z;
       const d = Math.hypot(dx, dz);
-      if (d < 3.4 && d > 0.01) { P.x += dx / d * (3.4 - d) * 0.5; P.z += dz / d * (3.4 - d) * 0.5; }
+      const R = (P.beam + r.boat.beam * r.boat.size) * 0.9 + 1.4;
+      if (d < R && d > 0.01) { P.x += dx / d * (R - d) * 0.5; P.z += dz / d * (R - d) * 0.5; }
     }
+    if (this.ride && !this.boatOf(this.ride.id)) this._leaveRide();
     this._syncBoat(dt);
 
     // ---- look / aim
@@ -494,22 +684,27 @@ export class Game {
         this._camIdle = 0;
       }
     }
-    const aimYaw = P.h + this.aimRel;
+    const platform = this._platform();
+    platform.object.updateMatrixWorld(true);
+    const platformH = platform.object.rotation.y;
+    const aimYaw = platformH + this.aimRel;
 
     // ---- angler pose (on land the walker poses it)
     if (walking) this.land.update(dt, inp, look);
-    else this._poseAngler(dt, aimYaw);
+    else this._poseAngler(dt, aimYaw, platform);
 
     // ---- fishing rig
     const fishingActive = this.mode === 'fish' && !blocked && inp.locked;
     const m = inp.mouse;
     const head = this.angler.head.getWorldPosition(new THREE.Vector3());
-    const netPos = _v2.copy(this.boat.seats.fisher).applyMatrix4(this.boat.object.matrixWorld);
-    netPos.y = waterY(netPos.z);
+    const seatLocal = this.ride ? platform.passengerSeats[this.ride.seat % platform.passengerSeats.length] : platform.seats.fisher;
+    const netPos = seatWorld(platform, seatLocal, _v2);
+    netPos.y = ENV.waterLevel(netPos.x, netPos.z);
     if (this.mode === 'fish') {
+      const rv = this.ride ? this.remotes.get(this.ride.id)?.vel : null;
       this.rig.update(dt, {
         head, yaw: aimYaw, pitch: this.aimPitch, active: fishingActive, netPos,
-        boatVel: _v.set(P.vx, 0, P.vz),
+        boatVel: rv ? _v.copy(rv) : _v.set(P.vx, 0, P.vz),
         input: {
           castHeld: fishingActive && m.left, castDown: fishingActive && m.leftDown, castUp: m.leftUp,
           reel: fishingActive && m.left && this.rig.state !== 'charging' && this.rig.state !== 'idle',
@@ -525,7 +720,7 @@ export class Game {
       // landing net animation
       if (this.rig.state === 'landing' && this.rig.fish) {
         const n = this.net.object;
-        this.boat.object.remove(n); this.scene.add(n);
+        if (n.parent !== this.scene) { n.parent?.remove(n); this.scene.add(n); }
         n.position.copy(head).add(_v.set(0, -0.6, 0));
         n.lookAt(this.rig.fish.pos.clone().add(_v.set(0, -0.15, 0)));
         n.updateMatrixWorld(true);
@@ -533,22 +728,24 @@ export class Game {
         this.scene.remove(this.net.object); this.boat.object.add(this.net.object); this._restNet();
       }
     } else if (!walking) {
-      this.angler.setHandTargets(this.boat.tillerGrip.getWorldPosition(new THREE.Vector3()), null);
+      const helm = this.ride ? null : this.boat.helm;
+      this.angler.setHandTargets(helm?.right ? helm.right.getWorldPosition(new THREE.Vector3()) : null, helm?.left ? helm.left.getWorldPosition(new THREE.Vector3()) : null);
     }
     this.angler.update(dt);
     this.land.updateShop(dt);
     this._interactions(blocked);
 
     // ---- fish + world
-    const focus = walking ? this.land.pos : new THREE.Vector3(P.x, P.y, P.z);
-    this.fishMgr.update(dt, { pos: _v.set(P.x, P.y, P.z).clone(), throttle: P.throttle }, this.camera.position);
+    const here = walking ? this.land.pos : platform.object.position;
+    const focus = here;
+    this.fishMgr.update(dt, { pos: here.clone(), throttle: this.ride ? (this.remotes.get(this.ride.id)?.s?.th || 0) : P.throttle }, this.camera.position);
     for (const c of this.crateFish) c.model.update(dt);
     this.effects.boat(dt, P);
     this.effects.update(dt);
 
     // ---- camera
     if (walking) this.land.camera(this.camera, dt);
-    else this._updateCamera(dt, head, aimYaw);
+    else this._updateCamera(dt, head, aimYaw, platform);
     this.world.update(dt, this.camera, focus);
     this.world.updateReflections(this.camera.position);
 
@@ -556,23 +753,23 @@ export class Game {
     for (const r of this.remotes.values()) r.update(dt);
 
     // ---- audio + HUD
-    flowAt(P.x, P.z, _f);
-    const vx = bankX(SPAWN_Z, VILLAGE_SIDE, 60);
     const lp = this.camera.position;
-    const villageD = Math.hypot(lp.x - vx, lp.z - SPAWN_Z);
+    const home = this.world.layout.homeMark || this.world.layout.docks[0];
+    const villageD = home ? Math.hypot(lp.x - home.x, lp.z - home.z) : 1e9;
     this._wdT = (this._wdT || 0) - dt;
     if (this._wdT <= 0) { this._wdT = 0.5; this._wd = walking ? this._waterDist(this.land.pos) : 0; }
-    this.audio.ambience(dt, { rapids: rapids(lp.z), throttle: P.throttle, nearVillage: Math.max(0, 1 - villageD / 400), speed: P.speedOverGround, camera: this.camera, onLand: walking, waterDist: this._wd || 0, layout: this.world.layout });
+    this.audio.ambience(dt, { rapids: ENV.rapids(lp.x, lp.z), throttle: P.throttle, nearVillage: Math.max(0, 1 - villageD / 400), speed: P.speedOverGround, camera: this.camera, onLand: walking, waterDist: this._wd || 0, layout: this.world.layout });
     if (playing) {
       this._hudFrame(aimYaw);
       this._mmT = (this._mmT || 0) - dt;
       if (this._mmT <= 0) {
         this._mmT = 0.1;
         const others = [...this.remotes.values()].map(r => ({ x: r.pos.x, z: r.pos.z, h: r.h, color: r.color }));
-        const me = walking ? { x: this.land.pos.x, z: this.land.pos.z, h: this.land.yaw } : { x: P.x, z: P.z, h: P.h };
-        const marks = [{ x: bankX(SPAWN_Z, VILLAGE_SIDE, 70), z: SPAWN_Z, label: '⌂', color: '#fff' },
-          ...this.land.shops.map(sh => ({ x: sh.frontWorld.x, z: sh.frontWorld.z, label: '$', color: '#f2c14e' }))];
-        if (walking) marks.push({ x: P.x, z: P.z, label: '⛵', color: '#fff' });
+        const me = walking ? { x: this.land.pos.x, z: this.land.pos.z, h: this.land.yaw } : { x: platform.object.position.x, z: platform.object.position.z, h: platformH };
+        const marks = [];
+        if (home) marks.push({ x: home.x, z: home.z, label: home.label || '⌂', color: '#fff' });
+        for (const sh of this.land.shops) marks.push({ x: sh.frontWorld.x, z: sh.frontWorld.z, label: '$', color: '#f2c14e' });
+        if (walking || this.ride) marks.push({ x: P.x, z: P.z, label: '⛵', color: '#fff' });
         this.hud.minimap(me, others, marks);
       }
     }
@@ -584,16 +781,28 @@ export class Game {
     inp.endFrame();
   }
 
-  // context prompts + E to act: go ashore, board, open the shop
+  // context prompts + E to act: go ashore, ride along, board, open the shop
   _interactions(blocked) {
     this._prompt = '';
     if (blocked || this.mode === 'menu') return;
     const P = this.phys;
     const inp = this.input;
+    if (this.ride) {
+      this._prompt = this.mode === 'fish' ? '' : 'Riding along · F to fish · G back to your boat';
+      if (inp.hit('KeyG')) this._leaveRide();
+      return;
+    }
     if (this.mode === 'drive') {
       this._landT = (this._landT || 0) - 1;
-      if (this._landT <= 0) { this._landT = 6; this._landing = P.speedOverGround < 2.5 ? this.land.findLanding(P) : null; }
-      if (this._landing) {
+      if (this._landT <= 0) {
+        this._landT = 6;
+        this._rider = P.speedOverGround < 2.5 ? this._rideCandidate() : null;
+        this._landing = !this._rider && P.speedOverGround < 2.5 ? this.land.findLanding(P) : null;
+      }
+      if (this._rider) {
+        this._prompt = `E: Hop aboard ${this._rider.info.name || 'their'}'s boat`;
+        if (inp.hit('KeyE')) this._startRide(this._rider);
+      } else if (this._landing) {
         this._prompt = 'E: Go ashore';
         if (inp.hit('KeyE')) { const spot = this.land.findLanding(P); if (spot) this._goAshore(spot); }
       }
@@ -603,41 +812,46 @@ export class Game {
       if (L.nearShop()) {
         this._prompt = 'E: Open the Fischerei';
         if (inp.hit('KeyE')) L.openShop();
-      } else if (dBoat < 3.8) {
+      } else if (dBoat < 2.5 + P.halfLen * 0.5) {
         this._prompt = 'E: Board the boat';
         if (inp.hit('KeyE')) this._board();
       }
     }
   }
 
-  // metres from a point on land to the river's edge (coarse march toward the centreline)
+  // metres from a point on land to the water's edge (coarse search in 8 directions)
   _waterDist(p) {
-    const dir = Math.sign(centerX(p.z) - p.x) || 1;
-    for (let d = 0; d < 400; d += 4) {
-      const x = p.x + dir * d;
-      if (this.land.groundY(x, p.z) < waterY(p.z)) return d;
+    let best = 400;
+    for (let a = 0; a < 8; a++) {
+      const dx = Math.cos(a * Math.PI / 4), dz = Math.sin(a * Math.PI / 4);
+      for (let d = 0; d < best; d += 4) {
+        const x = p.x + dx * d, z = p.z + dz * d;
+        if (this.land.groundY(x, z) < ENV.waterLevel(x, z)) { best = d; break; }
+      }
     }
-    return 400;
+    return best;
   }
 
   _handleKeys() {
     const inp = this.input;
+    if (inp.hit('KeyU')) { this.workshop.show(); return; }
+    if (inp.hit('KeyO')) { this.settings.show(); return; }
     if (this.mode === 'walk') return; // on land only E (handled in _interactions) and menus apply
     if (inp.hit('KeyF')) {
       if (this.mode === 'drive') {
         this.mode = 'fish';
-        this.aimRel = this.camYaw - this.phys.h;
+        this.aimRel = this.ride ? 0 : this.camYaw - this.phys.h;
         this.aimPitch = -0.08;
         this.rig.setVisible(true);
-        this.hud.notify('Fishing — hold LMB to cast. F to drive again', false);
+        this.hud.notify('Fishing — hold LMB to cast. F to stop', false);
       } else if (this.rig.state === 'idle') {
         this.mode = 'drive';
         this.rig.setVisible(false);
-        this.camYaw = this.phys.h + this.aimRel;
+        this.camYaw = this._platform().object.rotation.y + this.aimRel;
         this.angler.setFirstPerson?.(false);
       } else this.hud.notify('Reel in first', false);
     }
-    if (inp.hit('KeyQ')) {
+    if (inp.hit('KeyQ') && !this.ride) {
       const on = !this.phys.anchored;
       this.phys.setAnchor(on);
       if (on) this.phys.throttle = 0;
@@ -668,44 +882,40 @@ export class Game {
     this.boat.update(dt, this.time);
   }
 
-  _poseAngler(dt, aimYaw) {
+  _poseAngler(dt, aimYaw, platform) {
     const a = this.angler;
+    let seat;
+    if (this.ride) seat = platform.passengerSeats[this.ride.seat % platform.passengerSeats.length];
+    else seat = this.mode === 'fish' ? platform.seats.fisher : platform.seats.driver;
+    a.setStance('sit');
     if (this.mode === 'fish') {
-      a.object.position.copy(this.boat.seats.fisher);
       // sit facing bow or stern, twist the torso for the rest
-      let rel = this.aimRel % (Math.PI * 2);
-      if (rel > Math.PI) rel -= Math.PI * 2;
-      if (rel < -Math.PI) rel += Math.PI * 2;
-      const facing = Math.abs(rel) > Math.PI * 0.62 ? Math.PI : 0;
-      this._bodyYaw = this._bodyYaw ?? facing;
-      this._bodyYaw += (facing - this._bodyYaw) * Math.min(1, dt * 4);
-      a.object.rotation.set(0, this._bodyYaw, 0);
-      let tw = rel - this._bodyYaw;
-      while (tw > Math.PI) tw -= Math.PI * 2;
-      while (tw < -Math.PI) tw += Math.PI * 2;
-      a.setLook(tw, this.aimPitch);
+      const rel = wrapPi(this.aimRel);
+      // seats with a backrest can't turn round: twist further instead
+      const aft = platform.seatInfo?.canFaceAft;
+      const canAft = !aft ? true : this.ride ? aft.passengers?.[this.ride.seat % platform.passengerSeats.length] !== false : aft.fisher !== false;
+      const facing = canAft && Math.abs(rel) > Math.PI * 0.62 ? Math.PI : 0;
+      this.bodyYaw += wrapPi(facing - this.bodyYaw) * Math.min(1, dt * 4);
+      placeAngler(a, platform, seat, this.bodyYaw);
+      a.setLook(wrapPi(rel - this.bodyYaw), this.aimPitch);
       a.setFirstPerson?.(!this.camTP);
     } else {
-      a.object.position.copy(this.boat.seats.driver);
-      a.object.rotation.set(0, 0, 0);
-      this._bodyYaw = 0;
-      let rel = this.camYaw - this.phys.h;
-      while (rel > Math.PI) rel -= Math.PI * 2;
-      while (rel < -Math.PI) rel += Math.PI * 2;
+      this.bodyYaw = 0;
+      placeAngler(a, platform, seat, 0);
+      const rel = wrapPi(this.camYaw - platform.object.rotation.y);
       a.setLook(THREE.MathUtils.clamp(rel * 0.4, -0.8, 0.8), 0);
       a.setFirstPerson?.(false);
     }
-    this.boat.object.updateMatrixWorld(true);
   }
 
-  _updateCamera(dt, head, aimYaw) {
+  _updateCamera(dt, head, aimYaw, platform) {
     const cam = this.camera;
     const P = this.phys;
+    const bp = platform.object.position;
     if (this.mode === 'menu') {
       const t = this.time * 0.035;
-      const cx = P.x, cz = P.z;
-      cam.position.set(cx + Math.sin(t) * 46, P.y + 11 + Math.sin(t * 1.7) * 3, cz + Math.cos(t) * 46);
-      cam.lookAt(cx, P.y + 2, cz + 10);
+      cam.position.set(P.x + Math.sin(t) * 46, P.y + 11 + Math.sin(t * 1.7) * 3, P.z + Math.cos(t) * 46);
+      cam.lookAt(P.x, P.y + 2, P.z + 10);
       cam.fov = 55; cam.updateProjectionMatrix();
       return;
     }
@@ -728,19 +938,15 @@ export class Game {
       if (cam.fov !== 60) { cam.fov = 60; cam.updateProjectionMatrix(); }
     } else {
       // chase camera, eases behind the boat while under way
+      const h = platform.object.rotation.y;
       this._camIdle = (this._camIdle || 0) + dt;
-      if (this._camIdle > 2.5 && Math.abs(P.throttle) > 0.15) {
-        let d = P.h - this.camYaw;
-        while (d > Math.PI) d -= Math.PI * 2;
-        while (d < -Math.PI) d += Math.PI * 2;
-        this.camYaw += d * Math.min(1, dt * 0.8);
-      }
-      const dist = this.camDist;
-      const want = _v.set(P.x - Math.sin(this.camYaw) * Math.cos(this.camPitch) * dist, P.y + 1.4 + Math.sin(this.camPitch) * dist, P.z - Math.cos(this.camYaw) * Math.cos(this.camPitch) * dist);
-      const minY = waterY(want.z) + 0.6;
+      if (this._camIdle > 2.5 && (Math.abs(P.throttle) > 0.15 || this.ride)) this.camYaw += wrapPi(h - this.camYaw) * Math.min(1, dt * 0.8);
+      const dist = this.camDist * Math.max(1, (platform.size || 1) * 0.9 + (platform.length || 7.5) / 30);
+      const want = _v.set(bp.x - Math.sin(this.camYaw) * Math.cos(this.camPitch) * dist, bp.y + 1.4 + Math.sin(this.camPitch) * dist, bp.z - Math.cos(this.camYaw) * Math.cos(this.camPitch) * dist);
+      const minY = ENV.surface(want.x, want.z) + 0.8;
       if (want.y < minY) want.y = minY;
       cam.position.lerp(want, Math.min(1, dt * 10));
-      cam.lookAt(P.x, P.y + 1.3, P.z);
+      cam.lookAt(bp.x, bp.y + 1.3, bp.z);
       if (cam.fov !== 60) { cam.fov = 60; cam.updateProjectionMatrix(); }
     }
     if (shake > 0) { cam.position.x += (Math.random() - 0.5) * shake * 0.1; cam.position.y += (Math.random() - 0.5) * shake * 0.1; }
@@ -753,22 +959,24 @@ export class Game {
     if (this.mode === 'fish') {
       if (R.bite) { prompt = R.bite.float ? 'The float is down — STRIKE! (right mouse)' : 'STRIKE! (right mouse)'; pulse = true; }
       else if (R.snagged) prompt = 'Snagged — jerk with right mouse, or reel to break off';
-      else if (R.state === 'fight' && R.canNet) { prompt = 'Press E to net it'; pulse = true; }
+      else if (R.state === 'fight' && R.canNet) { prompt = R.fish?.weight > 80 ? 'Press E to gaff it' : 'Press E to net it'; pulse = true; }
       else if (R.state === 'fight' && R.tension > R.lineBreakKg * 9.81 * 0.85) { prompt = 'Line strained — ease off!'; pulse = true; }
       else if (R.state === 'idle') prompt = this.input.locked ? 'Hold left mouse to cast' : '';
       else if (R.state === 'flight') prompt = 'Space to stop the line';
     }
     if (!prompt && this._prompt) prompt = this._prompt;
-    if (!this.input.locked && !this.hud.overlayOpen && !this.chatOpen) prompt = 'Click to play';
-    const lureDepth = R.fish ? Math.max(0, waterY(R.fish.pos.z) - R.fish.pos.y)
-      : R.state === 'water' ? Math.max(0, waterY(R.lurePos.z) - (R.lureType === 'float' ? R.baitPos.y : R.lurePos.y)) : 0;
+    if (!this.input.locked && !this._overlay() && !this.chatOpen) prompt = 'Click to play';
+    const lureDepth = R.fish ? Math.max(0, ENV.waterLevel(R.fish.pos.x, R.fish.pos.z) - R.fish.pos.y)
+      : R.state === 'water' ? Math.max(0, ENV.waterLevel(R.lurePos.x, R.lurePos.z) - (R.lureType === 'float' ? R.baitPos.y : R.lurePos.y)) : 0;
     const yaw = this.mode === 'fish' ? aimYaw : this.mode === 'walk' ? this.land.camYaw : this.camYaw;
+    const skipper = this.ride ? (this.remotes.get(this.ride.id)?.info.name || 'a friend') : null;
+    const speedSrc = this.ride ? this.remotes.get(this.ride.id)?.vel : null;
     this.hud.frame({
       yaw,
-      modeLabel: this.mode === 'walk' ? 'On foot' : this.mode === 'fish' ? `Fishing · ${P.anchored ? 'anchored' : 'drifting'}` : (P.moored ? 'Moored' : P.anchored ? 'At anchor' : 'Under way'),
+      modeLabel: this.mode === 'walk' ? 'On foot' : skipper ? `Aboard with ${skipper}` : this.mode === 'fish' ? `Fishing · ${P.anchored ? 'anchored' : 'drifting'}` : (P.moored ? 'Moored' : P.anchored ? 'At anchor' : 'Under way'),
       walking: this.mode === 'walk', moored: !!P.moored, money: this.land.money, crate: this.land.crate.length, breakKg: R.lineBreakKg,
       prompt, promptPulse: pulse,
-      speed: P.speedOverGround, throttle: P.throttle, anchored: P.anchored, current: P.flowSpeed,
+      speed: speedSrc ? speedSrc.length() : P.speedOverGround, throttle: P.throttle, anchored: P.anchored, current: P.flowSpeed,
       fishing: this.mode === 'fish',
       tension: R.tension, drag: R.drag, lineOut: R.lineOut, lureDepth,
       stamina: R.fish ? R.fish.stamina : null,
@@ -785,26 +993,32 @@ export class Game {
       const o = hf.model.object;
       f = { sp: hf.species, l: r(hf.len), p: [r(o.position.x), r(o.position.y), r(o.position.z)], y: r(hf.yaw), pi: r(hf.pitch), ro: r(hf.roll) };
     }
+    // the full look rides along every couple of seconds (and right after a change)
+    this.netTick++;
+    const lk = (this._lookDirty || this.netTick % 20 === 0) ? JSON.stringify(this.look) : undefined;
+    this._lookDirty = false;
     this.network.sendState({
       b: P.serialize().map(r), th: r(P.throttle), sr: r(P.steer), an: P.anchored ? 1 : 0,
-      m: this.mode === 'fish' ? 'fish' : this.mode === 'walk' ? 'walk' : 'drive', ay: r(aimYaw), ap: r(this.aimPitch),
-      r: this.rig.netState(), f, pt: this.land.paint ?? -1,
+      m: this.mode === 'fish' ? 'fish' : this.mode === 'walk' ? 'walk' : 'drive', ay: r(aimYaw), ap: r(this.aimPitch), by: r(this.bodyYaw),
+      r: this.rig.netState(), f, lk,
+      ride: this.ride ? [this.ride.id, this.ride.seat] : null,
       w: this.mode === 'walk' ? [r(this.land.pos.x), r(this.land.pos.y), r(this.land.pos.z), r(this.land.yaw), r(this.land.phase % 6.2832), r(this.land.walkAmt)] : null,
     });
   }
 
-  renderOverlay() {
+  renderOverlay(dt = 1 / 60) {
+    this.workshop?.draw(this.renderer, dt);
     if (!this.pendingCatch || !this.trophy.fish) return;
     const tr = this.trophy;
     const r = this.renderer;
     const w = innerWidth, h = innerHeight;
     const vw = Math.round(w * 0.6), vh = h;
-    tr.t += 1 / 60;
+    tr.t += dt;
     // side-on hero shot, gently turning
     tr.fish.object.rotation.set(Math.sin(tr.t * 0.9) * 0.06, Math.PI / 2 + Math.sin(tr.t * 0.5) * 0.55, Math.sin(tr.t * 1.3) * 0.06);
     tr.fish.setSwim(0.15, Math.sin(tr.t) * 0.3);
     tr.fish.setStruggle(0.15);
-    tr.fish.update(1 / 60);
+    tr.fish.update(dt);
     tr.camera.aspect = vw / vh;
     tr.camera.updateProjectionMatrix();
     const halfTan = Math.tan(THREE.MathUtils.degToRad(tr.camera.fov / 2));
@@ -822,4 +1036,3 @@ export class Game {
     r.autoClear = true;
   }
 }
-

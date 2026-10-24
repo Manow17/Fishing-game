@@ -258,7 +258,7 @@ function branchTexture() {
   t.minFilter = THREE.LinearMipmapLinearFilter;
   t.magFilter = THREE.LinearFilter;
   t.colorSpace = THREE.SRGBColorSpace;
-  t.anisotropy = 8;
+  t.anisotropy = 16;
   t.needsUpdate = true;
   _branchTex = t;
   return t;

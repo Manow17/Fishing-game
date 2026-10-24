@@ -1,11 +1,11 @@
 // On-land play: walking around the village, the Fischerei stall, the wallet and boat upgrades.
 import * as THREE from 'three';
-import { sampleHeight as heightAt } from '../world/terrain.js';
-import { waterY } from '../world/river.js';
-import { SPAWN_Z, VILLAGE_SIDE, bankX } from '../world/layout.js';
+import { ENV } from '../world/env.js';
+const heightAt = (x, z) => ENV.groundY(x, z);
+const waterY = (x, z) => ENV.waterLevel(x, z);
 import { createShop } from '../models/shop.js';
 import { STAND_HIP_HEIGHT } from '../models/angler.js';
-import { SPECIES } from './species.js';
+import { SPECIES, tradeWeight } from './species.js';
 
 export const MOTORS = [
   { name: 'Stock 15 hp', mult: 1.0, price: 0, paint: null, paintName: 'Varnished larch' },
@@ -19,7 +19,7 @@ export const BRAID = { name: 'Braided line', price: 300, breakKg: 10.5 };
 // What the Fischerei pays for a fish (CHF)
 export function fishPrice(f) {
   const s = SPECIES[f.species];
-  return Math.max(2, Math.round(s.value * 1.6 * (0.6 + f.weight)));
+  return Math.max(2, Math.round(s.value * 1.6 * (0.6 + tradeWeight(f.weight))));
 }
 
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _g = new THREE.Vector3();
@@ -34,10 +34,7 @@ export class Land {
     this.dock = L.docks[0];
     // collision circles: buildings, cows, shop bodies
     this.colliders = [];
-    for (const c of L.chalets) this.colliders.push({ x: c.x, z: c.z, r: 6.2 });
-    for (const b of L.barns) this.colliders.push({ x: b.x, z: b.z, r: 4.2 });
-    if (L.church) this.colliders.push({ x: L.church.x, z: L.church.z, r: 8.5 });
-    for (const c of L.cows) this.colliders.push({ x: c.x, z: c.z, r: 1.2 });
+    for (const c of L.colliders || []) this.colliders.push(c);
     // a Fischerei stall on the gravel bank next to each dock, facing the water
     this.shops = L.shops.map((spot) => {
       const shop = createShop();
@@ -54,7 +51,7 @@ export class Land {
     });
     this.shop = this.shops[0];
     this.shopFront = this.shop.frontWorld;
-    this.trees = game.world.forest.trees;
+    this.trees = game.world.forest?.trees || [];
 
     this.pos = new THREE.Vector3();
     this.yaw = 0;
@@ -110,11 +107,11 @@ export class Land {
   }
   walkable(x, z) {
     if (this.onDock(x, z)) return true;
-    return heightAt(x, z) > waterY(z) - 0.25;
+    return heightAt(x, z) > waterY(x, z) - 0.25;
   }
   surface(x, z) {
     if (this.onDock(x, z)) return 'wood';
-    return heightAt(x, z) - waterY(z) < 1.6 ? 'gravel' : 'grass';
+    return heightAt(x, z) - waterY(x, z) < 1.6 ? (ENV.id === 'ocean' ? 'sand' : 'gravel') : 'grass';
   }
 
   // Landing spot next to the boat (dock deck or dry bank), or null.
@@ -125,7 +122,7 @@ export class Land {
     for (const side of [-1, 1]) for (const off of [-2.2, -1, 0, 1, 2.2]) for (const reach of [1.3, 2.0, 2.8]) {
       const x = phys.x + rx * side * reach + fx * off, z = phys.z + rz * side * reach + fz * off;
       if (!this.walkable(x, z)) continue;
-      if (!this.onDock(x, z) && heightAt(x, z) < waterY(z) - 0.05) continue;
+      if (!this.onDock(x, z) && heightAt(x, z) < waterY(x, z) - 0.05) continue;
       const d = reach + Math.abs(off) * 0.3;
       if (d < bestD) { bestD = d; best = new THREE.Vector3(x, this.groundY(x, z), z); }
     }
@@ -226,7 +223,7 @@ export class Land {
       target.x - Math.sin(this.camYaw) * Math.cos(this.camPitch) * dist,
       target.y + Math.sin(this.camPitch) * dist,
       target.z - Math.cos(this.camYaw) * Math.cos(this.camPitch) * dist);
-    const gy = Math.max(this.groundY(want.x, want.z), waterY(want.z)) + 0.35;
+    const gy = Math.max(this.groundY(want.x, want.z), ENV.surface(want.x, want.z)) + 0.35;
     if (want.y < gy) want.y = gy;
     cam.position.lerp(want, Math.min(1, dt * 12));
     cam.lookAt(target);
@@ -282,7 +279,7 @@ export class Land {
     this.save();
     this.game.applyUpgrades();
     this.game.audio.purchase?.();
-    this.game.hud.notify(`${m.name} fitted — boat painted ${m.paintName}!`, true);
+    this.game.hud.notify(`${m.name} fitted — your boat is faster!`, true);
     this.render();
   }
 
@@ -320,7 +317,7 @@ export class Land {
         : (next || this.infinite) ? `<button class="primary" data-motor="${i}" ${this.money < m.price ? 'disabled' : ''}>Buy · CHF ${m.price}</button>`
           : `<button disabled>Locked</button>`;
       return `<div class="sh-up ${owned ? 'owned' : ''}"><span class="sw" style="background:${sw}"></span>
-        <div class="sh-txt"><b>${m.name}</b><span class="dim">${Math.round((m.mult - 1) * 100) > 0 ? '+' + Math.round((m.mult - 1) * 100) + '% thrust · ' : ''}${m.paintName} hull</span></div>${btn}</div>`;
+        <div class="sh-txt"><b>${m.name}</b><span class="dim">${Math.round((m.mult - 1) * 100) > 0 ? '+' + Math.round((m.mult - 1) * 100) + '% thrust' : 'Factory outboard'}</span></div>${btn}</div>`;
     });
     rows.push(`<div class="sh-up ${this.braid ? 'owned' : ''}"><span class="sw" style="background:linear-gradient(135deg,#d7e36a,#7a8a2a)"></span>
       <div class="sh-txt"><b>${BRAID.name}</b><span class="dim">Breaking strain 7.2 → ${BRAID.breakKg} kg</span></div>

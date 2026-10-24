@@ -8,7 +8,7 @@ export function makeCanvas(w, h = w) {
   return c;
 }
 
-export function toTexture(canvas, { srgb = true, repeat = true, aniso = 8 } = {}) {
+export function toTexture(canvas, { srgb = true, repeat = true, aniso = 16 } = {}) { // three clamps to the GPU max
   const t = new THREE.CanvasTexture(canvas);
   if (srgb) t.colorSpace = THREE.SRGBColorSpace;
   if (repeat) t.wrapS = t.wrapT = THREE.RepeatWrapping;

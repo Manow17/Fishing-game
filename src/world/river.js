@@ -56,6 +56,18 @@ export function flowMax(z) {
   return 2.1 * (40 / halfWidth(z)) + 2.2 * rapids(z);
 }
 
+// Vertical wave displacement, identical to the water vertex shader (water.js) so boats and floats ride
+// exactly the surface you see. S = lobby wave scale (1 = normal), n = lateral position, depth = water depth.
+export function riverWave(x, z, t, S, rp, n, depth) {
+  let w = (Math.sin(z * 0.9 + x * 0.3 - t * 2.1) * 0.03 + Math.sin(z * 0.37 - x * 0.55 + t * 1.3) * 0.04) * S;
+  const S2 = Math.max(S - 1, 0);
+  if (S2 > 0) w += S2 * (Math.sin(z * 0.11 + x * 0.05 - t * 0.9) * 0.28 + Math.sin(z * 0.071 - x * 0.13 + t * 0.7) * 0.22 + Math.sin(x * 0.09 + z * 0.03 - t * 1.1) * 0.12);
+  const lat = 1 - smoothstep(0.3, 1.0, Math.abs(n));
+  w += rp * (Math.sin(z * 1.6 + Math.sin(x * 0.7) * 1.5) * 0.18 + Math.sin(x * 2.1 + z * 0.8 + t * 3.0) * 0.08) * lat * Math.min(1.5, 0.4 + S * 0.6);
+  const shore = 1 - smoothstep(0.05, 0.5, depth);
+  return w * (1 - shore);
+}
+
 // Signed lateral distance from the centerline (meters, + = east/+X side) and normalized distance.
 export function riverCoords(x, z, out = {}) {
   const s = centerSlope(z);
